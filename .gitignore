@@ -1,0 +1,51 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Optional Cargo lockfile rule
+# (Cargo.lock is typically kept for binaries and ignored or kept for libraries depending on workflow)
+# Cargo.lock
+
+# Archivos e imágenes de disco / pruebas locales (evitar subir imágenes pesadas)
+*.vmdk
+*.raw
+*.img
+*.qcow2
+*.vdi
+*.vhd
+*.vhdx
+*.iso
+*.dmg
+
+# Entornos y variables locales
+.env
+.env.*
+!.env.example
+
+# IDEs y Editores
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
+*~
+.zed/
+
+# Sistema Operativo
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+thumbs.db
+desktop.ini
+[Dd]esktop.ini
+$RECYCLE.BIN/

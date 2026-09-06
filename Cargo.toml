@@ -1,0 +1,23 @@
+[package]
+name = "vmspect"
+version = "0.2.0"
+edition = "2021"
+authors = ["Juan"]
+description = "Biblioteca en Rust para inspección estática, análisis y extracción de información de imágenes de disco de máquinas virtuales (VMDK, RAW, QCOW2, etc.)."
+license = "MIT OR Apache-2.0"
+readme = "readme.md"
+repository = "https://github.com/usuario/vmspect"
+keywords = ["vm", "vmdk", "qemu", "inspection", "forensics"]
+categories = ["filesystem", "command-line-utilities", "parser-implementations"]
+
+[dependencies]
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ext4 = "0.9"
+ntfs = "0.4"
+nt-hive = "0.3"
+positioned-io = "0.2"
+
+[dev-dependencies]
+tempfile = "3.10"

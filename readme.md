@@ -82,7 +82,7 @@ Add `vmspect` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vmspect = "0.4.0"
+vmspect = "0.4.1"
 ```
 
 ---

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.4.1] - 2026-09-07
+
+### Changed
+- Unified the repository version with the `cargo` package version by bumping to `0.4.1` (no functional changes).
+
 ## [0.4.0] - 2026-09-07
 
 **Breaking API refactor — public API reorganization for idiomatic Rust conventions.**

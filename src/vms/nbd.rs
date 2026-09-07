@@ -1,12 +1,12 @@
-//! Cliente y conector para `qemu-nbd` (Network Block Device).
+//! Client and connector for `qemu-nbd` (Network Block Device).
 //!
-//! Permite acceder a formatos de disco no soportados de manera nativa (o forzados)
-//! sirviendo la imagen mediante un subproceso de `qemu-nbd` en segundo plano
-//! y leyendo bloques a través de un socket UNIX o TCP loopback (127.0.0.1), evitando el costo
-//! de invocar subprocesos repetitivos y escribir archivos temporales a disco.
+//! Provides access to disk formats that are not supported natively (or that the user forces
+//! through `qemu-nbd`) by serving the image through a background `qemu-nbd` subprocess and
+//! reading blocks via a UNIX socket or a loopback TCP socket (127.0.0.1). This avoids the cost
+//! of repeatedly spawning subprocesses or writing temporary files to disk.
 
-use crate::models::{InfoImagen, Opciones};
-use crate::vms::stream::nuevo_comando;
+use crate::models::{ImageInfo, Options};
+use crate::vms::stream::new_command;
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -25,7 +25,7 @@ const NBD_CMD_DISC: u16 = 2;
 const NBD_OPT_EXPORT_NAME: u32 = 1;
 const NBD_IHAVEOPT_MAGIC: u64 = 0x4948_4156_454F_5054; // "IHAVEOPT"
 
-/// Abstracción de transporte para stream de comunicación NBD (TCP o Socket UNIX).
+/// Transport abstraction for the NBD communication stream (TCP or UNIX socket).
 enum StreamTransport {
     Tcp(TcpStream),
     #[cfg(unix)]
@@ -70,17 +70,17 @@ impl Write for StreamTransport {
     }
 }
 
-/// Cliente mínimo para el protocolo NBD (Network Block Device).
+/// Minimal client for the NBD (Network Block Device) protocol.
 pub struct NbdStream {
     stream: StreamTransport,
-    tamano_export: u64,
+    export_size: u64,
     request_id: u64,
 }
 
 impl NbdStream {
-    /// Realiza el handshake estándar (newstyle) sobre el transporte proporcionado.
+    /// Performs the standard (newstyle) handshake over the provided transport.
     fn handshake(mut stream: StreamTransport) -> io::Result<Self> {
-        // 1. Lectura del banner inicial del servidor
+        // 1. Read the initial banner from the server.
         // Magic: "NBDMAGIC" (8 bytes) + "IHAVEOPT" (8 bytes) + flags (2 bytes)
         let mut banner = [0u8; 18];
         stream.read_exact(&mut banner)?;
@@ -88,7 +88,7 @@ impl NbdStream {
         if &banner[0..8] != b"NBDMAGIC" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Firma NBD inválida en el servidor",
+                "Invalid NBD signature from the server",
             ));
         }
 
@@ -97,16 +97,13 @@ impl NbdStream {
             .and_then(|s| s.try_into().ok())
             .map(u64::from_be_bytes)
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Buffer insuficiente para opt_magic",
-                )
+                io::Error::new(io::ErrorKind::InvalidData, "Buffer too small for opt_magic")
             })?;
         if opt_magic != NBD_IHAVEOPT_MAGIC {
-            // Si es un handshake antiguo (oldstyle)
+            // Old-style handshake
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "El servidor NBD no utiliza newstyle handshake",
+                "The NBD server does not use the newstyle handshake",
             ));
         }
 
@@ -116,11 +113,11 @@ impl NbdStream {
             .map(u16::from_be_bytes)
             .unwrap_or(0);
 
-        // 2. Enviar client flags (NBD_FLAG_C_FIXED_NEWSTYLE = 1)
+        // 2. Send client flags (NBD_FLAG_C_FIXED_NEWSTYLE = 1)
         let client_flags: u32 = 1;
         stream.write_all(&client_flags.to_be_bytes())?;
 
-        // 3. Negociar exportación (NBD_OPT_EXPORT_NAME = 1, export_name = "")
+        // 3. Negotiate the export (NBD_OPT_EXPORT_NAME = 1, export_name = "")
         let export_name = b"";
         let mut opt_req = Vec::with_capacity(16 + export_name.len());
         opt_req.extend_from_slice(&NBD_IHAVEOPT_MAGIC.to_be_bytes());
@@ -130,78 +127,78 @@ impl NbdStream {
         stream.write_all(&opt_req)?;
         stream.flush()?;
 
-        // 4. Recibir respuesta de exportación
-        // tamano_export (8 bytes) + flags (2 bytes) + ceros (124 bytes) = 134 bytes
+        // 4. Receive the export reply.
+        // export_size (8 bytes) + flags (2 bytes) + zeros (124 bytes) = 134 bytes
         let mut resp = [0u8; 134];
         stream.read_exact(&mut resp)?;
 
-        let tamano_export = resp
+        let export_size = resp
             .get(0..8)
             .and_then(|s| s.try_into().ok())
             .map(u64::from_be_bytes)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Buffer insuficiente para tamano_export",
+                    "Buffer too small for export_size",
                 )
             })?;
 
         Ok(Self {
             stream,
-            tamano_export,
+            export_size,
             request_id: 1,
         })
     }
 
-    /// Conecta a un servidor NBD y realiza el handshake estándar (newstyle) sobre TCP.
-    pub fn conectar(direccion: &str) -> io::Result<Self> {
-        Self::conectar_tcp(direccion)
+    /// Connects to an NBD server and performs the standard (newstyle) handshake over TCP.
+    pub fn connect(address: &str) -> io::Result<Self> {
+        Self::connect_tcp(address)
     }
 
-    /// Conecta a un servidor NBD sobre TCP y realiza el handshake estándar.
-    pub fn conectar_tcp(direccion: &str) -> io::Result<Self> {
-        let stream = TcpStream::connect(direccion)?;
+    /// Connects to an NBD server over TCP and performs the standard handshake.
+    pub fn connect_tcp(address: &str) -> io::Result<Self> {
+        let stream = TcpStream::connect(address)?;
         stream.set_nodelay(true)?;
         Self::handshake(StreamTransport::Tcp(stream))
     }
 
-    /// Conecta a un servidor NBD mediante un socket de dominio UNIX.
-    pub fn conectar_unix(ruta: &Path) -> io::Result<Self> {
+    /// Connects to an NBD server via a UNIX domain socket.
+    pub fn connect_unix(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            let stream = std::os::unix::net::UnixStream::connect(ruta)?;
+            let stream = std::os::unix::net::UnixStream::connect(path)?;
             Self::handshake(StreamTransport::Unix(stream))
         }
         #[cfg(not(unix))]
         {
-            let _ = ruta;
+            let _ = path;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Sockets de dominio UNIX no están soportados en esta plataforma",
+                "UNIX domain sockets are not supported on this platform",
             ))
         }
     }
 
-    /// Obtiene el tamaño total exportado por el servidor NBD en bytes.
-    pub fn tamano_export(&self) -> u64 {
-        self.tamano_export
+    /// Returns the total size, in bytes, exported by the NBD server.
+    pub fn export_size(&self) -> u64 {
+        self.export_size
     }
 
-    /// Lee una porción de bytes en `offset` con longitud `len`.
-    pub fn leer_rango(&mut self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    /// Reads a chunk of bytes starting at `offset` of length `len`.
+    pub fn read_range(&mut self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
 
-        if offset >= self.tamano_export {
+        if offset >= self.export_size {
             return Ok(Vec::new());
         }
 
-        let len_ajustado = len.min((self.tamano_export - offset) as usize);
+        let adjusted_len = len.min((self.export_size - offset) as usize);
         let req_id = self.request_id;
         self.request_id = self.request_id.wrapping_add(1);
 
-        // Armar cabecera de petición NBD (28 bytes)
+        // Build the NBD request header (28 bytes)
         // 4: Magic, 2: Flags, 2: Command, 8: Handle, 8: Offset, 4: Length
         let mut req = [0u8; 28];
         req[0..4].copy_from_slice(&NBD_REQUEST_MAGIC.to_be_bytes());
@@ -209,12 +206,12 @@ impl NbdStream {
         req[6..8].copy_from_slice(&NBD_CMD_READ.to_be_bytes());
         req[8..16].copy_from_slice(&req_id.to_be_bytes());
         req[16..24].copy_from_slice(&offset.to_be_bytes());
-        req[24..28].copy_from_slice(&(len_ajustado as u32).to_be_bytes());
+        req[24..28].copy_from_slice(&(adjusted_len as u32).to_be_bytes());
 
         self.stream.write_all(&req)?;
         self.stream.flush()?;
 
-        // Leer cabecera de respuesta (16 bytes)
+        // Read the response header (16 bytes)
         // 4: Magic, 4: Error, 8: Handle
         let mut resp_hdr = [0u8; 16];
         self.stream.read_exact(&mut resp_hdr)?;
@@ -224,12 +221,12 @@ impl NbdStream {
             .and_then(|s| s.try_into().ok())
             .map(u32::from_be_bytes)
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Buffer insuficiente para magic")
+                io::Error::new(io::ErrorKind::InvalidData, "Buffer too small for magic")
             })?;
         if magic != NBD_REPLY_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Respuesta NBD con magic inválido: 0x{:08X}", magic),
+                format!("NBD reply with invalid magic: 0x{:08X}", magic),
             ));
         }
 
@@ -240,12 +237,12 @@ impl NbdStream {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Buffer insuficiente para error_code",
+                    "Buffer too small for error_code",
                 )
             })?;
         if error_code != 0 {
             return Err(io::Error::other(format!(
-                "Error reportado por servidor NBD: {}",
+                "Error reported by the NBD server: {}",
                 error_code
             )));
         }
@@ -255,26 +252,23 @@ impl NbdStream {
             .and_then(|s| s.try_into().ok())
             .map(u64::from_be_bytes)
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Buffer insuficiente para handle",
-                )
+                io::Error::new(io::ErrorKind::InvalidData, "Buffer too small for handle")
             })?;
         if handle != req_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Identificador de petición NBD desincronizado",
+                "NBD request identifier is out of sync",
             ));
         }
 
-        let mut datos = vec![0u8; len_ajustado];
-        self.stream.read_exact(&mut datos)?;
+        let mut data = vec![0u8; adjusted_len];
+        self.stream.read_exact(&mut data)?;
 
-        Ok(datos)
+        Ok(data)
     }
 
-    /// Cierra limpiamente la sesión NBD enviando el comando disconnect y cerrando el socket.
-    pub fn desconectar(&mut self) {
+    /// Cleanly closes the NBD session by sending the disconnect command and closing the socket.
+    pub fn disconnect(&mut self) {
         let req_id = self.request_id;
         let mut req = [0u8; 28];
         req[0..4].copy_from_slice(&NBD_REQUEST_MAGIC.to_be_bytes());
@@ -288,136 +282,136 @@ impl NbdStream {
 
 impl Drop for NbdStream {
     fn drop(&mut self) {
-        self.desconectar();
+        self.disconnect();
     }
 }
 
-/// Transporte de conexión seleccionado para negociar con el subproceso `qemu-nbd`.
+/// Selected connection transport used to negotiate with the `qemu-nbd` subprocess.
 ///
-/// Modela como invariante de tipos la elección mutuamente excluyente entre socket UNIX y
-/// TCP loopback, evitando estados intermedios inválidos en tiempo de ejecución.
-enum TransporteNbd {
+/// Models the mutually exclusive choice between a UNIX socket and a loopback TCP connection
+/// as a type invariant, avoiding invalid intermediate states at runtime.
+enum NbdTransport {
     Tcp(String),
     Unix(PathBuf),
 }
 
-impl TransporteNbd {
-    fn conectar(&self) -> io::Result<NbdStream> {
+impl NbdTransport {
+    fn connect(&self) -> io::Result<NbdStream> {
         match self {
-            TransporteNbd::Unix(ruta) => NbdStream::conectar_unix(ruta),
-            TransporteNbd::Tcp(direccion) => NbdStream::conectar_tcp(direccion),
+            NbdTransport::Unix(path) => NbdStream::connect_unix(path),
+            NbdTransport::Tcp(address) => NbdStream::connect_tcp(address),
         }
     }
 
-    fn socket_unix(&self) -> Option<PathBuf> {
+    fn unix_socket(&self) -> Option<PathBuf> {
         match self {
-            TransporteNbd::Unix(ruta) => Some(ruta.clone()),
-            TransporteNbd::Tcp(_) => None,
+            NbdTransport::Unix(path) => Some(path.clone()),
+            NbdTransport::Tcp(_) => None,
         }
     }
 }
 
-/// Lector respaldado por un servidor `qemu-nbd` ejecutándose en segundo plano.
-pub struct LectorNbd {
-    proceso: Child,
+/// Reader backed by a `qemu-nbd` server running in the background.
+pub struct NbdReader {
+    process: Child,
     client: RefCell<NbdStream>,
-    socket_unix: Option<PathBuf>,
+    unix_socket: Option<PathBuf>,
 }
 
-impl LectorNbd {
-    /// Inicia un subproceso de `qemu-nbd` y se conecta mediante NBD usando opciones por defecto.
-    pub fn abrir(
-        ruta_qemu_nbd: &Path,
-        info: &InfoImagen,
+impl NbdReader {
+    /// Spawns a `qemu-nbd` subprocess and connects via NBD using the default options.
+    pub fn open(
+        qemu_nbd_path: &Path,
+        info: &ImageInfo,
         cancel_token: Option<Arc<AtomicBool>>,
     ) -> io::Result<Self> {
-        let opciones = Opciones {
+        let options = Options {
             cancel_token,
-            ..Opciones::default()
+            ..Options::default()
         };
-        Self::abrir_con_opciones(ruta_qemu_nbd, info, &opciones)
+        Self::open_with_options(qemu_nbd_path, info, &options)
     }
 
-    /// Inicia un subproceso de `qemu-nbd` con las opciones dadas y se conecta mediante NBD
-    /// (sobre Socket UNIX o TCP loopback según configuración).
-    pub fn abrir_con_opciones(
-        ruta_qemu_nbd: &Path,
-        info: &InfoImagen,
-        opciones: &Opciones,
+    /// Spawns a `qemu-nbd` subprocess with the given options and connects via NBD
+    /// (over a UNIX socket or a loopback TCP connection according to the configuration).
+    pub fn open_with_options(
+        qemu_nbd_path: &Path,
+        info: &ImageInfo,
+        options: &Options,
     ) -> io::Result<Self> {
-        if let Some(ref cancel) = opciones.cancel_token {
+        if let Some(ref cancel) = options.cancel_token {
             if cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "Inspección cancelada por el usuario",
+                    "Inspection cancelled by the user",
                 ));
             }
         }
 
-        let mut cmd = nuevo_comando(ruta_qemu_nbd);
+        let mut cmd = new_command(qemu_nbd_path);
         cmd.arg("--read-only");
 
-        // Incluir --persistent solo si fue explícitamente solicitado
-        if opciones.persistente_nbd {
+        // Only include --persistent when explicitly requested
+        if options.nbd_persistent {
             cmd.arg("--persistent");
         }
 
-        // Agregar argumentos CLI adicionales
-        for arg in &opciones.args_extra_nbd {
+        // Append additional CLI arguments
+        for arg in &options.extra_nbd_args {
             cmd.arg(arg);
         }
 
-        let transporte = if let Some(ref ruta_sock) = opciones.socket_unix {
-            // Eliminar socket huérfano preexistente si existe
-            let _ = std::fs::remove_file(ruta_sock);
-            cmd.arg("-k").arg(ruta_sock);
-            TransporteNbd::Unix(ruta_sock.clone())
+        let transport = if let Some(ref socket_path) = options.unix_socket {
+            // Remove any orphaned socket file that may already exist
+            let _ = std::fs::remove_file(socket_path);
+            cmd.arg("-k").arg(socket_path);
+            NbdTransport::Unix(socket_path.clone())
         } else {
-            // Asignación dinámica de puerto TCP efímero en 127.0.0.1
-            let puerto = {
+            // Dynamically allocate an ephemeral TCP port on 127.0.0.1
+            let port = {
                 let listener = TcpListener::bind("127.0.0.1:0")?;
                 listener.local_addr()?.port()
             };
             cmd.arg("--bind")
                 .arg("127.0.0.1")
                 .arg("--port")
-                .arg(puerto.to_string());
-            TransporteNbd::Tcp(format!("127.0.0.1:{}", puerto))
+                .arg(port.to_string());
+            NbdTransport::Tcp(format!("127.0.0.1:{}", port))
         };
 
-        cmd.arg(&info.ruta)
+        cmd.arg(&info.path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(|e| {
             io::Error::other(format!(
-                "No se pudo iniciar qemu-nbd ({}): {}",
-                ruta_qemu_nbd.display(),
+                "Could not start qemu-nbd ({}): {}",
+                qemu_nbd_path.display(),
                 e
             ))
         })?;
 
-        // Reintentos de conexión con polling acotado por timeout_conexion (defecto 3s)
-        let timeout = opciones
-            .timeout_conexion
+        // Retry the connection with polling bounded by connection_timeout (3s default)
+        let timeout = options
+            .connection_timeout
             .unwrap_or_else(|| Duration::from_secs(3));
-        let inicio = Instant::now();
+        let start = Instant::now();
         let mut client_opt = None;
 
-        while inicio.elapsed() < timeout {
-            if let Some(ref cancel) = opciones.cancel_token {
+        while start.elapsed() < timeout {
+            if let Some(ref cancel) = options.cancel_token {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
-                        "Inspección cancelada",
+                        "Inspection cancelled",
                     ));
                 }
             }
 
-            // Verificar si el proceso terminó prematuramente con error
+            // Check whether the process terminated prematurely with an error
             if let Ok(Some(status)) = child.try_wait() {
                 let mut err_msg = String::new();
                 if let Some(mut stderr) = child.stderr.take() {
@@ -426,14 +420,14 @@ impl LectorNbd {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!(
-                        "qemu-nbd finalizó con código {:?}: {}",
+                        "qemu-nbd exited with code {:?}: {}",
                         status.code(),
                         err_msg.trim()
                     ),
                 ));
             }
 
-            match transporte.conectar() {
+            match transport.connect() {
                 Ok(stream) => {
                     client_opt = Some(stream);
                     break;
@@ -451,59 +445,59 @@ impl LectorNbd {
                 let _ = child.wait();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "Tiempo de espera agotado al conectar con el servidor qemu-nbd",
+                    "Timed out waiting for the qemu-nbd server to accept connections",
                 ));
             }
         };
 
         Ok(Self {
-            proceso: child,
+            process: child,
             client: RefCell::new(client),
-            socket_unix: transporte.socket_unix(),
+            unix_socket: transport.unix_socket(),
         })
     }
 
-    /// Obtiene el tamaño virtual del disco exportado por el servidor NBD.
-    pub fn tamano_virtual(&self) -> u64 {
-        self.client.borrow().tamano_export()
+    /// Returns the virtual size of the disk exported by the NBD server.
+    pub fn virtual_size(&self) -> u64 {
+        self.client.borrow().export_size()
     }
 
-    /// Lee un rango arbitrario de bytes directamente a través del socket NBD.
-    pub fn leer_rango(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        self.client.borrow_mut().leer_rango(offset, len)
+    /// Reads an arbitrary byte range directly through the NBD socket.
+    pub fn read_range(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.client.borrow_mut().read_range(offset, len)
     }
 }
 
-impl Drop for LectorNbd {
+impl Drop for NbdReader {
     fn drop(&mut self) {
-        // 1. Cerrar primero el stream de lectura/conexión
-        self.client.borrow_mut().desconectar();
+        // 1. Close the read/connection stream first.
+        self.client.borrow_mut().disconnect();
 
-        // 2. Comprobar si el subproceso finalizó o forzar kill defensivo y cosechar código de salida
-        match self.proceso.try_wait() {
+        // 2. Check whether the subprocess already finished, or force a defensive kill and reap.
+        match self.process.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {
-                let _ = self.proceso.kill();
-                let _ = self.proceso.wait();
+                let _ = self.process.kill();
+                let _ = self.process.wait();
             }
         }
 
-        // 3. Limpiar socket UNIX si fue configurado
-        if let Some(ref ruta) = self.socket_unix {
-            let _ = std::fs::remove_file(ruta);
+        // 3. Clean up the UNIX socket file if one was configured.
+        if let Some(ref path) = self.unix_socket {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
 
-/// Localiza el binario de `qemu-nbd` en el sistema.
-pub fn resolver_qemu_nbd(explicita: Option<&Path>) -> io::Result<PathBuf> {
-    if let Some(p) = explicita {
+/// Locates the `qemu-nbd` binary on the system.
+pub fn resolve_qemu_nbd(explicit: Option<&Path>) -> io::Result<PathBuf> {
+    if let Some(p) = explicit {
         if p.exists() {
             return Ok(p.to_path_buf());
         }
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("La ruta indicada para qemu-nbd no existe: {}", p.display()),
+            format!("The supplied qemu-nbd path does not exist: {}", p.display()),
         ));
     }
 
@@ -514,35 +508,35 @@ pub fn resolver_qemu_nbd(explicita: Option<&Path>) -> io::Result<PathBuf> {
         }
     }
 
-    let candidatos = [
+    let candidates = [
         r"C:\Program Files\qemu\qemu-nbd.exe",
         r"C:\Program Files (x86)\qemu\qemu-nbd.exe",
         "/usr/bin/qemu-nbd",
         "/usr/local/bin/qemu-nbd",
         "/opt/homebrew/bin/qemu-nbd",
     ];
-    for c in candidatos {
+    for c in candidates {
         let p = PathBuf::from(c);
         if p.exists() {
             return Ok(p);
         }
     }
 
-    // Verificar en PATH
-    let en_path = nuevo_comando("qemu-nbd")
+    // Look up in PATH
+    let on_path = new_command("qemu-nbd")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if en_path {
+    if on_path {
         return Ok(PathBuf::from("qemu-nbd"));
     }
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "No se encontró el ejecutable qemu-nbd en el sistema. Instálalo, añádelo al PATH, define QEMU_NBD o usa --qemu-nbd <ruta>.",
+        "The qemu-nbd executable was not found on the system. Install it, add it to PATH, define QEMU_NBD, or use --qemu-nbd <path>.",
     ))
 }
 
@@ -559,14 +553,14 @@ mod tests {
     }
 
     #[test]
-    fn test_nbd_stream_tcp_mock_handshake_y_lectura() {
+    fn test_nbd_stream_tcp_mock_handshake_and_read() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
 
-            // 1. Enviar banner inicial (18 bytes)
+            // 1. Send initial banner (18 bytes)
             let mut banner = Vec::new();
             banner.extend_from_slice(b"NBDMAGIC");
             banner.extend_from_slice(&NBD_IHAVEOPT_MAGIC.to_be_bytes());
@@ -574,22 +568,22 @@ mod tests {
             stream.write_all(&banner).unwrap();
             stream.flush().unwrap();
 
-            // 2. Leer client flags (4 bytes)
+            // 2. Read client flags (4 bytes)
             let mut client_flags = [0u8; 4];
             stream.read_exact(&mut client_flags).unwrap();
             assert_eq!(u32::from_be_bytes(client_flags), 1);
 
-            // 3. Leer option request (16 bytes)
+            // 3. Read option request (16 bytes)
             let mut opt_req = [0u8; 16];
             stream.read_exact(&mut opt_req).unwrap();
 
-            // 4. Enviar export reply (134 bytes): export size = 2048
+            // 4. Send export reply (134 bytes): export size = 2048
             let mut export_reply = vec![0u8; 134];
             export_reply[0..8].copy_from_slice(&2048u64.to_be_bytes());
             stream.write_all(&export_reply).unwrap();
             stream.flush().unwrap();
 
-            // 5. Leer petición de lectura (28 bytes)
+            // 5. Read the read request (28 bytes)
             let mut read_req = [0u8; 28];
             stream.read_exact(&mut read_req).unwrap();
             assert_eq!(
@@ -606,7 +600,7 @@ mod tests {
             assert_eq!(offset, 100);
             assert_eq!(len, 4);
 
-            // 6. Enviar respuesta de lectura (16 bytes header + 4 bytes payload)
+            // 6. Send the read reply (16-byte header + 4-byte payload)
             let mut reply_hdr = [0u8; 16];
             reply_hdr[0..4].copy_from_slice(&NBD_REPLY_MAGIC.to_be_bytes());
             reply_hdr[4..8].copy_from_slice(&0u32.to_be_bytes());
@@ -615,7 +609,7 @@ mod tests {
             stream.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
             stream.flush().unwrap();
 
-            // 7. Leer disconnect (28 bytes)
+            // 7. Read the disconnect (28 bytes)
             let mut disc_req = [0u8; 28];
             stream.read_exact(&mut disc_req).unwrap();
             assert_eq!(
@@ -624,19 +618,19 @@ mod tests {
             );
         });
 
-        let mut nbd = NbdStream::conectar_tcp(&addr).unwrap();
-        assert_eq!(nbd.tamano_export(), 2048);
+        let mut nbd = NbdStream::connect_tcp(&addr).unwrap();
+        assert_eq!(nbd.export_size(), 2048);
 
-        let datos = nbd.leer_rango(100, 4).unwrap();
-        assert_eq!(datos, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let data = nbd.read_range(100, 4).unwrap();
+        assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
 
-        nbd.desconectar();
+        nbd.disconnect();
         server.join().unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_nbd_stream_unix_mock_handshake_y_lectura() {
+    fn test_nbd_stream_unix_mock_handshake_and_read() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("nbd_test.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
@@ -677,11 +671,11 @@ mod tests {
             let _ = stream.read_exact(&mut disc_req);
         });
 
-        let mut nbd = NbdStream::conectar_unix(&sock_path).unwrap();
-        assert_eq!(nbd.tamano_export(), 4096);
+        let mut nbd = NbdStream::connect_unix(&sock_path).unwrap();
+        assert_eq!(nbd.export_size(), 4096);
 
-        let datos = nbd.leer_rango(0, 4).unwrap();
-        assert_eq!(datos, vec![0x11, 0x22, 0x33, 0x44]);
+        let data = nbd.read_range(0, 4).unwrap();
+        assert_eq!(data, vec![0x11, 0x22, 0x33, 0x44]);
 
         drop(nbd);
         server.join().unwrap();
@@ -689,23 +683,23 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
-    fn test_nbd_stream_unix_unsupported_en_no_unix() {
-        let res = NbdStream::conectar_unix(Path::new("C:\\temp\\dummy.sock"));
+    fn test_nbd_stream_unix_unsupported_on_non_unix() {
+        let res = NbdStream::connect_unix(Path::new("C:\\temp\\dummy.sock"));
         assert!(res.is_err());
         assert_eq!(res.err().unwrap().kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
-    fn test_opciones_nbd_configuracion() {
-        let opc = Opciones::default()
-            .with_socket_unix("/tmp/nbd.sock")
+    fn test_options_nbd_configuration() {
+        let opc = Options::default()
+            .with_unix_socket("/tmp/nbd.sock")
             .with_extra_nbd_args(vec!["--cache=writeback".to_string()])
             .with_connection_timeout(Duration::from_millis(500))
-            .with_persistente_nbd(false);
+            .with_nbd_persistent(false);
 
-        assert_eq!(opc.socket_unix, Some(PathBuf::from("/tmp/nbd.sock")));
-        assert_eq!(opc.args_extra_nbd, vec!["--cache=writeback".to_string()]);
-        assert_eq!(opc.timeout_conexion, Some(Duration::from_millis(500)));
-        assert!(!opc.persistente_nbd);
+        assert_eq!(opc.unix_socket, Some(PathBuf::from("/tmp/nbd.sock")));
+        assert_eq!(opc.extra_nbd_args, vec!["--cache=writeback".to_string()]);
+        assert_eq!(opc.connection_timeout, Some(Duration::from_millis(500)));
+        assert!(!opc.nbd_persistent);
     }
 }

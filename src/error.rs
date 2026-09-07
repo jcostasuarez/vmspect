@@ -1,56 +1,56 @@
-//! Manejo centralizado de errores para `vmspect`.
+//! Centralized error handling for `vmspect`.
 
 use thiserror::Error;
 
-/// Enumeración con los tipos de errores que pueden producirse durante la inspección y análisis.
+/// Enumeration of error kinds that may be produced during inspection and analysis.
 #[derive(Debug, Error)]
 pub enum VmSpectError {
-    /// Error de entrada/salida (I/O).
-    #[error("Error de E/S: {0}")]
+    /// I/O error.
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Error durante el parseo de estructuras de disco, particiones, sistemas de archivos o registros.
-    #[error("Error de parseo: {0}")]
+    /// Failure while parsing disk structures, partitions, file systems or registry hives.
+    #[error("Parse error: {0}")]
     Parse(String),
 
-    /// Sistema operativo no soportado o no reconocido.
-    #[error("Sistema operativo no soportado: {0}")]
+    /// Unsupported or unrecognized operating system.
+    #[error("Unsupported operating system: {0}")]
     UnsupportedOs(String),
 
-    /// Formato de imagen de disco no soportado o desconocido.
-    #[error("Formato de imagen no soportado: {0}")]
+    /// Unsupported or unknown disk image format.
+    #[error("Unsupported image format: {0}")]
     UnsupportedFormat(String),
 
-    /// La imagen especificada no existe en la ruta indicada.
-    #[error("Imagen de disco no encontrada: {0}")]
+    /// The specified image does not exist at the given path.
+    #[error("Disk image not found: {0}")]
     ImageNotFound(String),
 
-    /// La operación de inspección fue cancelada por el usuario o token de cancelación.
-    #[error("La inspección fue cancelada por el usuario")]
+    /// The inspection operation was cancelled by the user or cancellation token.
+    #[error("Inspection was cancelled by the user")]
     Cancelled,
 
-    /// Binario o herramienta `qemu-nbd` no encontrada en el sistema.
-    #[error("Herramienta QEMU no disponible: {0}")]
+    /// `qemu-nbd` binary or tool not found on the system.
+    #[error("QEMU tool not available: {0}")]
     QemuNotFound(String),
 
-    /// Error durante la inicialización o comunicación con el servidor NBD.
-    #[error("Error de protocolo NBD: {0}")]
+    /// Error while initializing or communicating with the NBD server.
+    #[error("NBD protocol error: {0}")]
     Nbd(String),
 
-    /// Error en la lectura o navegación del sistema de archivos (NTFS, EXT4, etc.).
-    #[error("Error de sistema de archivos: {0}")]
+    /// Error reading or navigating the file system (NTFS, EXT4, etc.).
+    #[error("File system error: {0}")]
     FileSystem(String),
 
-    /// Error en la extracción o análisis de colmenas del Registro de Windows.
-    #[error("Error en el Registro de Windows: {0}")]
+    /// Error extracting or analyzing Windows Registry hives.
+    #[error("Windows Registry error: {0}")]
     WindowsRegistry(String),
 
-    /// Error de configuración u opciones.
-    #[error("Error de configuración: {0}")]
+    /// Configuration or options error.
+    #[error("Configuration error: {0}")]
     Config(String),
 
-    /// Error genérico o mensaje descriptivo de fallo durante el análisis.
-    #[error("Error de inspección: {0}")]
+    /// Generic or descriptive inspection failure message.
+    #[error("Inspection error: {0}")]
     Other(String),
 }
 
@@ -66,7 +66,7 @@ impl From<&str> for VmSpectError {
     }
 }
 
-/// Alias estándar de `Result` utilizado en toda la biblioteca `vmspect`.
+/// Standard `Result` alias used across the `vmspect` library.
 pub type Result<T> = std::result::Result<T, VmSpectError>;
 
 #[cfg(test)]
@@ -77,17 +77,17 @@ mod tests {
     fn test_error_display() {
         let err_io = VmSpectError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "archivo no encontrado",
+            "file not found",
         ));
-        assert!(err_io.to_string().contains("Error de E/S"));
+        assert!(err_io.to_string().contains("I/O error"));
 
         let err_cancel = VmSpectError::Cancelled;
         assert_eq!(
             err_cancel.to_string(),
-            "La inspección fue cancelada por el usuario"
+            "Inspection was cancelled by the user"
         );
 
-        let err_other: VmSpectError = "algo falló".into();
-        assert_eq!(err_other.to_string(), "Error de inspección: algo falló");
+        let err_other: VmSpectError = "something failed".into();
+        assert_eq!(err_other.to_string(), "Inspection error: something failed");
     }
 }

@@ -1,28 +1,28 @@
 use crate::error::Result;
-use crate::models::traits::{InspectorOS, ResultadoAnalisis, VmDriver};
-use crate::models::{Opciones, Particion, VMInfo};
+use crate::models::traits::{AnalysisResult, OsInspector, VmDriver};
+use crate::models::{GuestInfo, Options, Partition};
 
-pub(crate) struct DesconocidoInspector;
+pub(crate) struct UnknownInspector;
 
-impl InspectorOS for DesconocidoInspector {
-    fn analizar(
+impl OsInspector for UnknownInspector {
+    fn analyze(
         &self,
         _driver: &dyn VmDriver,
-        _particiones: &[Particion],
-        _tamano_chunk: u64,
-        opciones: &Opciones,
-    ) -> Result<ResultadoAnalisis> {
-        Ok(ResultadoAnalisis {
-            vm_info: if opciones.debe_analizar_sistema() {
-                VMInfo {
-                    os_nombre: "Sistema operativo desconocido".to_string(),
-                    ..VMInfo::default()
+        _partitions: &[Partition],
+        _chunk_size: u64,
+        options: &Options,
+    ) -> Result<AnalysisResult> {
+        Ok(AnalysisResult {
+            guest_info: if options.should_analyze_system() {
+                GuestInfo {
+                    os_name: "Unknown operating system".to_string(),
+                    ..GuestInfo::default()
                 }
             } else {
-                VMInfo::default()
+                GuestInfo::default()
             },
-            programas: Vec::new(),
-            advertencias: Vec::new(),
+            programs: Vec::new(),
+            warnings: Vec::new(),
         })
     }
 }
@@ -32,37 +32,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_desconocido_inspector() {
-        let inspector = DesconocidoInspector;
-        let opciones = Opciones::default();
-        let res = inspector
-            .analizar(&MockDriver, &[], 4096, &opciones)
-            .unwrap();
-        assert_eq!(res.vm_info.os_nombre, "Sistema operativo desconocido");
-        assert!(res.programas.is_empty());
+    fn test_unknown_inspector() {
+        let inspector = UnknownInspector;
+        let options = Options::default();
+        let res = inspector.analyze(&MockDriver, &[], 4096, &options).unwrap();
+        assert_eq!(res.guest_info.os_name, "Unknown operating system");
+        assert!(res.programs.is_empty());
 
-        let opciones_nosys = Opciones {
-            nosystem: true,
-            ..Opciones::default()
+        let options_nosys = Options {
+            no_system: true,
+            ..Options::default()
         };
         let res_nosys = inspector
-            .analizar(&MockDriver, &[], 4096, &opciones_nosys)
+            .analyze(&MockDriver, &[], 4096, &options_nosys)
             .unwrap();
-        assert_eq!(res_nosys.vm_info.os_nombre, "");
+        assert_eq!(res_nosys.guest_info.os_name, "");
     }
 
     struct MockDriver;
     impl VmDriver for MockDriver {
-        fn tamano_virtual(&self) -> u64 {
+        fn virtual_size(&self) -> u64 {
             0
         }
-        fn leer_rango(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
+        fn read_range(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
             Ok(())
         }
-        fn modo_acceso(&self) -> &str {
+        fn access_mode(&self) -> &str {
             "mock"
         }
-        fn es_nativo(&self) -> bool {
+        fn is_native(&self) -> bool {
             true
         }
     }

@@ -1,22 +1,22 @@
-//! Acceso al disco virtual: lectura nativa cuando es posible y `qemu-nbd` para formatos complejos.
+//! Virtual disk access: native parsing when possible and `qemu-nbd` for complex formats.
 //!
-//! Jerarquía
+//! Hierarchy
 //! ---------
-//! - [`LectorDisco`]: fachada única. Decide el backend al abrir la imagen y
-//!   ofrece `leer_rango(offset, len)` sobre coordenadas del disco virtual.
-//!   - **Nativo** (`std::fs::File` + `Seek`, sin procesos hijos): imágenes
-//!     `raw`, VMDK `monolithicSparse` sin padre, y VMDK con descriptor de texto
-//!     cuyos extents sean `FLAT`/`VMFS`/`SPARSE`/`ZERO` (monolithicFlat,
-//!     twoGbMaxExtentFlat/Sparse, vmfs).
-//!   - **qemu-nbd** ([`LectorNbd`]): formatos complejos (VDI, VHD/VHDX, QCOW2,
-//!     VMDK streamOptimized, snapshots/deltas, backing files...).
-//! - [`DiscoVirtual`]: vista `Read + Seek` sobre un rango del disco (una
-//!   partición) con caché LRU de chunks. Es lo que consumen los parsers.
+//! - [`DiskReader`]: single façade. Picks the backend when the image is opened
+//!   and exposes `read_range(offset, len)` on virtual disk coordinates.
+//!   - **Native** (`std::fs::File` + `Seek`, no child processes): `raw` images,
+//!     `monolithicSparse` VMDKs without a parent, and VMDK text-descriptor
+//!     files whose extents are `FLAT` / `VMFS` / `SPARSE` / `ZERO`
+//!     (`monolithicFlat`, `twoGbMaxExtentFlat`/`Sparse`, `vmfs`).
+//!   - **`qemu-nbd`** ([`NbdReader`]): complex formats (VDI, VHD/VHDX, QCOW2,
+//!     streamOptimized VMDK, snapshots/deltas, backing files, ...).
+//! - [`VirtualDisk`]: `Read + Seek` view of a disk range (typically a single
+//!   partition) with an LRU chunk cache. Consumed by the parsers.
 
 use crate::models::traits::{MemoryMapper, VmDriver};
-use crate::models::{Estadisticas, Hipervisor, InfoImagen, Opciones};
-use crate::vms::nbd::{self, LectorNbd};
-use crate::vms::vmdk::{self, Apertura, ExtentSparse};
+use crate::models::{Hypervisor, ImageInfo, Options, Stats};
+use crate::vms::nbd::{self, NbdReader};
+use crate::vms::vmdk::{self, OpenResult, SparseExtent};
 use positioned_io::ReadAt;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -29,9 +29,9 @@ use std::sync::Arc;
 
 const SECTOR: u64 = 512;
 
-/// Instancia un proceso hijo asegurando que en Windows no se cree ni abra una ventana de consola.
+/// Builds a child process ensuring that on Windows no console window is created or shown.
 #[inline]
-pub(crate) fn nuevo_comando<S: AsRef<std::ffi::OsStr>>(prog: S) -> Command {
+pub(crate) fn new_command<S: AsRef<std::ffi::OsStr>>(prog: S) -> Command {
     let mut cmd = Command::new(prog);
     #[cfg(windows)]
     {
@@ -42,29 +42,29 @@ pub(crate) fn nuevo_comando<S: AsRef<std::ffi::OsStr>>(prog: S) -> Command {
     cmd
 }
 
-/// Abre un archivo en modo solo lectura con permisos compartidos no bloqueantes (en Windows).
-pub(crate) fn abrir_archivo_lectura(ruta: &Path) -> io::Result<File> {
+/// Opens a file in read-only mode with shared, non-blocking permissions (Windows).
+pub(crate) fn open_read_file(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
-        // Permite lectura, escritura y eliminación compartida por otros procesos concurrentes
+        // Allow concurrent read, write and delete access by other processes.
         opts.share_mode(7);
-        opts.open(ruta)
+        opts.open(path)
     }
     #[cfg(not(windows))]
     {
-        File::open(ruta)
+        File::open(path)
     }
 }
 
 // -----------------------------------------------------------------------------
-// Identificación de la imagen (sin procesos si la cabecera es reconocible)
+// Image identification (without spawning a process if the header is recognizable)
 // -----------------------------------------------------------------------------
 
-fn formato_por_extension(ruta: &Path) -> Option<&'static str> {
-    let ext = ruta.extension()?.to_str()?.to_ascii_lowercase();
+fn format_by_extension(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
         "vmdk" => "vmdk",
         "vdi" => "vdi",
@@ -78,172 +78,172 @@ fn formato_por_extension(ruta: &Path) -> Option<&'static str> {
     })
 }
 
-/// Reconoce el formato por la firma de los primeros bytes. `None` si es ambiguo.
-fn formato_por_firma(cabecera: &[u8]) -> Option<&'static str> {
-    if cabecera.len() < 8 {
+/// Recognizes the format by inspecting the leading-byte signature. Returns `None` when ambiguous.
+fn format_by_signature(header: &[u8]) -> Option<&'static str> {
+    if header.len() < 8 {
         return None;
     }
-    if vmdk::es_cabecera_sparse(cabecera) || vmdk::es_descriptor_texto(cabecera) {
+    if vmdk::is_sparse_header(header) || vmdk::is_text_descriptor(header) {
         return Some("vmdk");
     }
-    if cabecera.starts_with(b"<<< ") && cabecera.len() >= 0x44 {
-        // Texto "<<< Oracle VM VirtualBox Disk Image >>>" + firma 0xBEDA107F en 0x40.
-        if cabecera[0x40..0x44] == [0x7F, 0x10, 0xDA, 0xBE] {
+    if header.starts_with(b"<<< ") && header.len() >= 0x44 {
+        // Text "<<< Oracle VM VirtualBox Disk Image >>>" + signature 0xBEDA107F at offset 0x40.
+        if header[0x40..0x44] == [0x7F, 0x10, 0xDA, 0xBE] {
             return Some("vdi");
         }
     }
-    if cabecera.starts_with(b"conectix") {
+    if header.starts_with(b"conectix") {
         return Some("vpc");
     }
-    if cabecera.starts_with(b"vhdxfile") {
+    if header.starts_with(b"vhdxfile") {
         return Some("vhdx");
     }
-    if cabecera.starts_with(b"QFI\xfb") {
+    if header.starts_with(b"QFI\xfb") {
         return Some("qcow2");
     }
-    if cabecera.starts_with(b"QED\0") {
+    if header.starts_with(b"QED\0") {
         return Some("qed");
     }
     None
 }
 
-/// Identifica la imagen inspeccionando cabeceras y descriptores de formato.
-pub(crate) fn identificar_imagen(_qemu_nbd: Option<&Path>, ruta: &Path) -> io::Result<InfoImagen> {
-    let mut archivo = abrir_archivo_lectura(ruta)?;
-    let tamano_archivo = archivo.metadata()?.len();
-    let mut cabecera = vec![0u8; 1024.min(tamano_archivo as usize)];
-    let _ = archivo.read(&mut cabecera);
+/// Identifies the image by inspecting its headers and format descriptors.
+pub(crate) fn identify_image(_qemu_nbd: Option<&Path>, path: &Path) -> io::Result<ImageInfo> {
+    let mut file = open_read_file(path)?;
+    let file_size = file.metadata()?.len();
+    let mut header = vec![0u8; 1024.min(file_size as usize)];
+    let _ = file.read(&mut header);
 
-    let formato = formato_por_firma(&cabecera).or_else(|| formato_por_extension(ruta));
+    let format = format_by_signature(&header).or_else(|| format_by_extension(path));
 
-    match formato {
-        Some("raw") => Ok(InfoImagen {
-            ruta: ruta.to_path_buf(),
-            formato: "raw".to_string(),
-            tamano_virtual: tamano_archivo,
-            tamano_real: tamano_archivo,
-            hipervisor: Hipervisor::Desconocido,
+    match format {
+        Some("raw") => Ok(ImageInfo {
+            path: path.to_path_buf(),
+            format: "raw".to_string(),
+            virtual_size: file_size,
+            actual_size: file_size,
+            hypervisor: Hypervisor::Unknown,
         }),
         Some("vmdk") => {
-            if let Some(capacidad) = capacidad_vmdk_nativa(ruta, &cabecera)? {
-                let tamano_real = calcular_tamano_real_vmdk(ruta, &cabecera);
-                return Ok(InfoImagen {
-                    ruta: ruta.to_path_buf(),
-                    formato: "vmdk".to_string(),
-                    tamano_virtual: capacidad,
-                    tamano_real,
-                    hipervisor: Hipervisor::VMware,
+            if let Some(capacity) = native_vmdk_capacity(path, &header)? {
+                let actual_size = compute_actual_vmdk_size(path, &header);
+                return Ok(ImageInfo {
+                    path: path.to_path_buf(),
+                    format: "vmdk".to_string(),
+                    virtual_size: capacity,
+                    actual_size,
+                    hypervisor: Hypervisor::VMware,
                 });
             }
-            let tamano_real = calcular_tamano_real_vmdk(ruta, &cabecera);
-            Ok(InfoImagen {
-                ruta: ruta.to_path_buf(),
-                formato: "vmdk".to_string(),
-                tamano_virtual: tamano_archivo,
-                tamano_real: if tamano_real > 0 {
-                    tamano_real
+            let actual_size = compute_actual_vmdk_size(path, &header);
+            Ok(ImageInfo {
+                path: path.to_path_buf(),
+                format: "vmdk".to_string(),
+                virtual_size: file_size,
+                actual_size: if actual_size > 0 {
+                    actual_size
                 } else {
-                    tamano_archivo
+                    file_size
                 },
-                hipervisor: Hipervisor::VMware,
+                hypervisor: Hypervisor::VMware,
             })
         }
         Some("qcow2") => {
-            let mut tamano_virtual = tamano_archivo;
-            if cabecera.len() >= 32 && cabecera.starts_with(b"QFI\xfb") {
-                if let Ok(tam) = cabecera[24..32].try_into().map(u64::from_be_bytes) {
-                    if tam > 0 {
-                        tamano_virtual = tam;
+            let mut virtual_size = file_size;
+            if header.len() >= 32 && header.starts_with(b"QFI\xfb") {
+                if let Ok(size) = header[24..32].try_into().map(u64::from_be_bytes) {
+                    if size > 0 {
+                        virtual_size = size;
                     }
                 }
             }
-            Ok(InfoImagen {
-                ruta: ruta.to_path_buf(),
-                formato: "qcow2".to_string(),
-                tamano_virtual,
-                tamano_real: tamano_archivo,
-                hipervisor: Hipervisor::Qemu,
+            Ok(ImageInfo {
+                path: path.to_path_buf(),
+                format: "qcow2".to_string(),
+                virtual_size,
+                actual_size: file_size,
+                hypervisor: Hypervisor::Qemu,
             })
         }
         Some("vpc") | Some("vhd") => {
-            let mut tamano_virtual = tamano_archivo;
-            if tamano_archivo >= 512 {
+            let mut virtual_size = file_size;
+            if file_size >= 512 {
                 let mut footer = [0u8; 512];
-                if archivo.seek(SeekFrom::Start(tamano_archivo - 512)).is_ok()
-                    && archivo.read_exact(&mut footer).is_ok()
+                if file.seek(SeekFrom::Start(file_size - 512)).is_ok()
+                    && file.read_exact(&mut footer).is_ok()
                     && footer.starts_with(b"conectix")
                 {
-                    if let Ok(tam) = footer[48..56].try_into().map(u64::from_be_bytes) {
-                        if tam > 0 {
-                            tamano_virtual = tam;
+                    if let Ok(size) = footer[48..56].try_into().map(u64::from_be_bytes) {
+                        if size > 0 {
+                            virtual_size = size;
                         }
                     }
-                } else if cabecera.starts_with(b"conectix") {
-                    if let Ok(tam) = cabecera[48..56].try_into().map(u64::from_be_bytes) {
-                        if tam > 0 {
-                            tamano_virtual = tam;
+                } else if header.starts_with(b"conectix") {
+                    if let Ok(size) = header[48..56].try_into().map(u64::from_be_bytes) {
+                        if size > 0 {
+                            virtual_size = size;
                         }
                     }
                 }
             }
-            Ok(InfoImagen {
-                ruta: ruta.to_path_buf(),
-                formato: "vpc".to_string(),
-                tamano_virtual,
-                tamano_real: tamano_archivo,
-                hipervisor: Hipervisor::HyperV,
+            Ok(ImageInfo {
+                path: path.to_path_buf(),
+                format: "vpc".to_string(),
+                virtual_size,
+                actual_size: file_size,
+                hypervisor: Hypervisor::HyperV,
             })
         }
         Some("vdi") => {
-            let mut tamano_virtual = tamano_archivo;
-            if cabecera.len() >= 0x178 && cabecera.starts_with(b"<<< ") {
-                if let Ok(tam) = cabecera[0x170..0x178].try_into().map(u64::from_le_bytes) {
-                    if tam > 0 {
-                        tamano_virtual = tam;
+            let mut virtual_size = file_size;
+            if header.len() >= 0x178 && header.starts_with(b"<<< ") {
+                if let Ok(size) = header[0x170..0x178].try_into().map(u64::from_le_bytes) {
+                    if size > 0 {
+                        virtual_size = size;
                     }
                 }
             }
-            Ok(InfoImagen {
-                ruta: ruta.to_path_buf(),
-                formato: "vdi".to_string(),
-                tamano_virtual,
-                tamano_real: tamano_archivo,
-                hipervisor: Hipervisor::VirtualBox,
+            Ok(ImageInfo {
+                path: path.to_path_buf(),
+                format: "vdi".to_string(),
+                virtual_size,
+                actual_size: file_size,
+                hypervisor: Hypervisor::VirtualBox,
             })
         }
         Some(fmt) => {
-            let hip = Hipervisor::desde_formato(fmt);
-            Ok(InfoImagen {
-                ruta: ruta.to_path_buf(),
-                formato: fmt.to_string(),
-                tamano_virtual: tamano_archivo,
-                tamano_real: tamano_archivo,
-                hipervisor: hip,
+            let hypervisor = Hypervisor::from_format(fmt);
+            Ok(ImageInfo {
+                path: path.to_path_buf(),
+                format: fmt.to_string(),
+                virtual_size: file_size,
+                actual_size: file_size,
+                hypervisor,
             })
         }
         None => {
-            let fmt = formato_por_extension(ruta).unwrap_or("raw");
-            Ok(InfoImagen {
-                ruta: ruta.to_path_buf(),
-                formato: fmt.to_string(),
-                tamano_virtual: tamano_archivo,
-                tamano_real: tamano_archivo,
-                hipervisor: Hipervisor::desde_formato(fmt),
+            let fmt = format_by_extension(path).unwrap_or("raw");
+            Ok(ImageInfo {
+                path: path.to_path_buf(),
+                format: fmt.to_string(),
+                virtual_size: file_size,
+                actual_size: file_size,
+                hypervisor: Hypervisor::from_format(fmt),
             })
         }
     }
 }
 
-/// Capacidad virtual de un VMDK leída de su cabecera/descriptor. `None` si no se pudo.
-fn capacidad_vmdk_nativa(ruta: &Path, cabecera: &[u8]) -> io::Result<Option<u64>> {
-    if vmdk::es_cabecera_sparse(cabecera) {
-        let cab = vmdk::leer_cabecera_sparse(cabecera)?;
-        return Ok(Some(cab.capacidad_sectores * SECTOR));
+/// Virtual capacity of a VMDK read from its header/descriptor. `None` if it could not be determined.
+fn native_vmdk_capacity(path: &Path, header: &[u8]) -> io::Result<Option<u64>> {
+    if vmdk::is_sparse_header(header) {
+        let cab = vmdk::read_sparse_header(header)?;
+        return Ok(Some(cab.capacity_sectors * SECTOR));
     }
-    if vmdk::es_descriptor_texto(cabecera) {
-        let texto = fs::read_to_string(ruta).unwrap_or_default();
-        let d = vmdk::parsear_descriptor(&texto);
-        let total: u64 = d.extents.iter().map(|e| e.sectores).sum();
+    if vmdk::is_text_descriptor(header) {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        let d = vmdk::parse_descriptor(&text);
+        let total: u64 = d.extents.iter().map(|e| e.sectors).sum();
         if total > 0 {
             return Ok(Some(total * SECTOR));
         }
@@ -251,17 +251,17 @@ fn capacidad_vmdk_nativa(ruta: &Path, cabecera: &[u8]) -> io::Result<Option<u64>
     Ok(None)
 }
 
-/// Calcula el tamaño físico real ocupado en disco por un VMDK (descriptor + extents asociados).
-fn calcular_tamano_real_vmdk(vmdk_path: &Path, cabecera: &[u8]) -> u64 {
+/// Computes the actual physical size on disk occupied by a VMDK (descriptor + associated extents).
+fn compute_actual_vmdk_size(vmdk_path: &Path, header: &[u8]) -> u64 {
     let mut total_bytes = fs::metadata(vmdk_path).map(|m| m.len()).unwrap_or(0);
 
-    if vmdk::es_descriptor_texto(cabecera) {
-        if let Ok(texto) = fs::read_to_string(vmdk_path) {
-            let descriptor = vmdk::parsear_descriptor(&texto);
+    if vmdk::is_text_descriptor(header) {
+        if let Ok(text) = fs::read_to_string(vmdk_path) {
+            let descriptor = vmdk::parse_descriptor(&text);
             for extent in &descriptor.extents {
-                if let Some(nombre_archivo) = &extent.archivo {
-                    let ruta_extent = vmdk::resolver_ruta_extent(vmdk_path, nombre_archivo);
-                    if let Ok(meta) = fs::metadata(&ruta_extent) {
+                if let Some(file_name) = &extent.file {
+                    let extent_path = vmdk::resolve_extent_path(vmdk_path, file_name);
+                    if let Ok(meta) = fs::metadata(&extent_path) {
                         total_bytes += meta.len();
                     }
                 }
@@ -273,357 +273,352 @@ fn calcular_tamano_real_vmdk(vmdk_path: &Path, cabecera: &[u8]) -> u64 {
 }
 
 // -----------------------------------------------------------------------------
-// Backends nativos y NBD
+// Native and NBD backends
 // -----------------------------------------------------------------------------
 
-/// Un extent de un VMDK con descriptor de texto, ya abierto.
-struct ExtentAbierto {
-    /// Posición del extent dentro del disco virtual (bytes).
-    inicio: u64,
-    longitud: u64,
-    datos: DatosExtent,
+/// An extent of a text-descriptor VMDK, already opened.
+struct OpenExtent {
+    /// Position of the extent inside the virtual disk (in bytes).
+    start: u64,
+    length: u64,
+    data: ExtentData,
 }
 
-enum DatosExtent {
-    /// Extent plano: los bytes están tal cual en el archivo desde `offset`.
-    Plano {
-        archivo: File,
+enum ExtentData {
+    /// Flat extent: the bytes live as-is in the file from `offset` onwards.
+    Flat {
+        file: File,
         offset: u64,
     },
-    Sparse(ExtentSparse),
-    Cero,
+    Sparse(SparseExtent),
+    Zero,
 }
 
 enum Backend {
-    /// Archivo raw: el disco virtual es el archivo.
+    /// Raw file: the virtual disk IS the file.
     Raw(File),
-    /// VMDK monolithicSparse.
-    Sparse(ExtentSparse),
-    /// VMDK con descriptor de texto y uno o más extents.
-    Extents(Vec<ExtentAbierto>),
-    /// Servidor qemu-nbd conectado por socket TCP en segundo plano (liviano y rápido).
-    Nbd(LectorNbd),
+    /// monolithicSparse VMDK.
+    Sparse(SparseExtent),
+    /// VMDK with a text descriptor and one or more extents.
+    Extents(Vec<OpenExtent>),
+    /// `qemu-nbd` server connected over a TCP socket in the background (lightweight and fast).
+    Nbd(NbdReader),
 }
 
-/// Fachada de acceso al disco virtual. Elige backend nativo o qemu-nbd al abrir.
-pub struct LectorDisco {
+/// Façade over the virtual disk. Picks the native or `qemu-nbd` backend at open time.
+pub struct DiskReader {
     backend: RefCell<Backend>,
-    tamano_virtual: u64,
-    modo_acceso: String,
-    stats: RefCell<Estadisticas>,
+    virtual_size: u64,
+    access_mode: String,
+    stats: RefCell<Stats>,
     cancel_token: Option<Arc<AtomicBool>>,
 }
 
-impl LectorDisco {
-    /// Abre la imagen seleccionando automáticamente el backend más óptimo.
+impl DiskReader {
+    /// Opens the image, automatically selecting the most optimal backend.
     ///
-    /// Prioridad:
-    /// 1. Backend nativo Rust (RAW / VMDK sparse / VMDK flat).
-    /// 2. `qemu-nbd` (socket local UNIX o TCP streaming, sin overhead de archivos temporales).
-    pub fn abrir(
+    /// Priority:
+    /// 1. Native Rust backend (RAW / sparse VMDK / flat VMDK).
+    /// 2. `qemu-nbd` (local UNIX socket or streaming TCP, with no temp-file overhead).
+    pub fn open(
         qemu_nbd: Option<&Path>,
-        info: &InfoImagen,
+        info: &ImageInfo,
         cancel_token: Option<Arc<AtomicBool>>,
     ) -> io::Result<Self> {
-        let opciones = Opciones {
+        let options = Options {
             qemu_nbd: qemu_nbd.map(|p| p.to_path_buf()),
             cancel_token,
-            ..Opciones::default()
+            ..Options::default()
         };
-        Self::abrir_con_opciones(info, &opciones)
+        Self::open_with_options(info, &options)
     }
 
-    /// Abre la imagen seleccionando automáticamente el backend más óptimo según las [`Opciones`] provistas.
-    pub fn abrir_con_opciones(info: &InfoImagen, opciones: &Opciones) -> io::Result<Self> {
-        let (backend, modo, tamano_ajustado) = match abrir_nativo(info)? {
-            Apertura::Nativa((b, modo)) => (b, format!("nativo ({})", modo), info.tamano_virtual),
-            Apertura::NecesitaNbd(motivo) => {
-                let ruta_nbd = nbd::resolver_qemu_nbd(opciones.qemu_nbd.as_deref())?;
-                let lector_nbd = LectorNbd::abrir_con_opciones(&ruta_nbd, info, opciones)?;
-                let tam_nbd = lector_nbd.tamano_virtual().max(info.tamano_virtual);
-                let canal = if opciones.socket_unix.is_some() {
+    /// Opens the image, automatically selecting the most optimal backend for the supplied [`Options`].
+    pub fn open_with_options(info: &ImageInfo, options: &Options) -> io::Result<Self> {
+        let (backend, mode, size_adjusted) = match open_native(info)? {
+            OpenResult::Native((b, mode)) => (b, format!("native ({})", mode), info.virtual_size),
+            OpenResult::NeedsNbd(reason) => {
+                let nbd_path = nbd::resolve_qemu_nbd(options.qemu_nbd.as_deref())?;
+                let nbd_reader = NbdReader::open_with_options(&nbd_path, info, options)?;
+                let size_nbd = nbd_reader.virtual_size().max(info.virtual_size);
+                let channel = if options.unix_socket.is_some() {
                     "unix"
                 } else {
                     "tcp"
                 };
                 (
-                    Backend::Nbd(lector_nbd),
-                    format!("qemu-nbd {} ({})", canal, motivo),
-                    tam_nbd,
+                    Backend::Nbd(nbd_reader),
+                    format!("qemu-nbd {} ({})", channel, reason),
+                    size_nbd,
                 )
             }
         };
 
         Ok(Self {
             backend: RefCell::new(backend),
-            tamano_virtual: tamano_ajustado,
-            stats: RefCell::new(Estadisticas {
-                modo_acceso: modo.clone(),
-                ..Estadisticas::default()
+            virtual_size: size_adjusted,
+            stats: RefCell::new(Stats {
+                access_mode: mode.clone(),
+                ..Stats::default()
             }),
-            modo_acceso: modo,
-            cancel_token: opciones.cancel_token.clone(),
+            access_mode: mode,
+            cancel_token: options.cancel_token.clone(),
         })
     }
 
-    /// Construye la fachada forzando el backend `qemu-nbd`.
-    pub fn desde_nbd(
-        lector: LectorNbd,
-        info: &InfoImagen,
+    /// Builds the façade forcing the `qemu-nbd` backend.
+    pub fn from_nbd(
+        reader: NbdReader,
+        info: &ImageInfo,
         cancel_token: Option<Arc<AtomicBool>>,
     ) -> Self {
-        let tamano_virtual = lector.tamano_virtual().max(info.tamano_virtual);
-        let modo = "qemu-nbd tcp (forzado)".to_string();
+        let virtual_size = reader.virtual_size().max(info.virtual_size);
+        let mode = "qemu-nbd tcp (forced)".to_string();
         Self {
-            backend: RefCell::new(Backend::Nbd(lector)),
-            tamano_virtual,
-            stats: RefCell::new(Estadisticas {
-                modo_acceso: modo.clone(),
-                ..Estadisticas::default()
+            backend: RefCell::new(Backend::Nbd(reader)),
+            virtual_size,
+            stats: RefCell::new(Stats {
+                access_mode: mode.clone(),
+                ..Stats::default()
             }),
-            modo_acceso: modo,
+            access_mode: mode,
             cancel_token,
         }
     }
 
-    /// Obtiene una descripción textual del modo de acceso utilizado.
-    pub fn modo_acceso(&self) -> &str {
-        &self.modo_acceso
+    /// Returns a textual description of the access mode in use.
+    pub fn access_mode(&self) -> &str {
+        &self.access_mode
     }
 
-    /// Obtiene una copia de las métricas y estadísticas recopiladas durante la lectura.
-    pub fn estadisticas(&self) -> Estadisticas {
+    /// Returns a copy of the metrics and statistics collected during reads.
+    pub fn stats(&self) -> Stats {
         self.stats.borrow().clone()
     }
 
-    /// Tamaño de chunk aconsejado para [`DiscoVirtual`].
-    pub fn tamano_chunk_recomendado(&self) -> u64 {
+    /// Recommended chunk size for [`VirtualDisk`].
+    pub fn recommended_chunk_size(&self) -> u64 {
         match &*self.backend.borrow() {
             Backend::Raw(_) | Backend::Sparse(_) | Backend::Extents(_) => 256 * 1024,
             Backend::Nbd(_) => 512 * 1024,
         }
     }
 
-    /// Lee `[offset, offset+len)` del disco virtual. Devuelve menos bytes al llegar al final.
-    pub fn leer_rango(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    /// Reads `[offset, offset+len)` from the virtual disk. May return fewer bytes when reaching the end.
+    pub fn read_range(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         if let Some(ref cancel) = self.cancel_token {
             if cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "Análisis cancelado por el usuario",
+                    "Analysis cancelled by the user",
                 ));
             }
         }
 
-        if offset >= self.tamano_virtual || len == 0 {
+        if offset >= self.virtual_size || len == 0 {
             return Ok(Vec::new());
         }
-        let len = len.min((self.tamano_virtual - offset) as usize);
+        let len = len.min((self.virtual_size - offset) as usize);
 
-        let datos = match &mut *self.backend.borrow_mut() {
-            Backend::Raw(archivo) => {
+        let data = match &mut *self.backend.borrow_mut() {
+            Backend::Raw(file) => {
                 let mut buf = vec![0u8; len];
-                archivo.seek(SeekFrom::Start(offset))?;
-                vmdk::leer_o_ceros(archivo, &mut buf)?;
+                file.seek(SeekFrom::Start(offset))?;
+                vmdk::read_or_zeros(file, &mut buf)?;
                 buf
             }
             Backend::Sparse(extent) => {
                 let mut buf = vec![0u8; len];
-                let n = extent.leer_en(offset, &mut buf)?;
+                let n = extent.read_at(offset, &mut buf)?;
                 buf.truncate(n);
                 buf
             }
-            Backend::Extents(extents) => leer_de_extents(extents, offset, len)?,
+            Backend::Extents(extents) => read_from_extents(extents, offset, len)?,
             Backend::Nbd(nbd) => {
-                self.stats.borrow_mut().peticiones_nbd += 1;
-                nbd.leer_rango(offset, len)?
+                self.stats.borrow_mut().nbd_requests += 1;
+                nbd.read_range(offset, len)?
             }
         };
 
-        self.stats.borrow_mut().bytes_leidos += datos.len() as u64;
-        Ok(datos)
+        self.stats.borrow_mut().bytes_read += data.len() as u64;
+        Ok(data)
     }
 }
 
-impl VmDriver for LectorDisco {
-    fn tamano_virtual(&self) -> u64 {
-        self.tamano_virtual
+impl VmDriver for DiskReader {
+    fn virtual_size(&self) -> u64 {
+        self.virtual_size
     }
 
-    fn leer_rango(&self, offset: u64, buf: &mut [u8]) -> crate::error::Result<()> {
-        let datos = self.leer_rango(offset, buf.len())?;
-        buf[..datos.len()].copy_from_slice(&datos);
-        if datos.len() < buf.len() {
-            buf[datos.len()..].fill(0);
+    fn read_range(&self, offset: u64, buf: &mut [u8]) -> crate::error::Result<()> {
+        let data = self.read_range(offset, buf.len())?;
+        buf[..data.len()].copy_from_slice(&data);
+        if data.len() < buf.len() {
+            buf[data.len()..].fill(0);
         }
         Ok(())
     }
 
-    fn modo_acceso(&self) -> &str {
-        &self.modo_acceso
+    fn access_mode(&self) -> &str {
+        &self.access_mode
     }
 
-    fn es_nativo(&self) -> bool {
+    fn is_native(&self) -> bool {
         matches!(
             &*self.backend.borrow(),
             Backend::Raw(_) | Backend::Sparse(_) | Backend::Extents(_)
         )
     }
 
-    fn tamano_chunk_recomendado(&self) -> u64 {
-        self.tamano_chunk_recomendado()
+    fn recommended_chunk_size(&self) -> u64 {
+        self.recommended_chunk_size()
     }
 }
 
-fn leer_de_extents(extents: &mut [ExtentAbierto], offset: u64, len: usize) -> io::Result<Vec<u8>> {
+fn read_from_extents(extents: &mut [OpenExtent], offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    let mut hecho = 0usize;
+    let mut done = 0usize;
 
-    while hecho < len {
-        let pos = offset + hecho as u64;
+    while done < len {
+        let pos = offset + done as u64;
         let Some(ext) = extents
             .iter_mut()
-            .find(|e| pos >= e.inicio && pos < e.inicio + e.longitud)
+            .find(|e| pos >= e.start && pos < e.start + e.length)
         else {
-            // Hueco no cubierto por ningún extent: ceros.
+            // Gap not covered by any extent: zeroes.
             break;
         };
-        let dentro = pos - ext.inicio;
-        let n = ((ext.longitud - dentro) as usize).min(len - hecho);
-        let destino = &mut buf[hecho..hecho + n];
+        let within = pos - ext.start;
+        let n = ((ext.length - within) as usize).min(len - done);
+        let dst = &mut buf[done..done + n];
 
-        match &mut ext.datos {
-            DatosExtent::Plano {
-                archivo,
-                offset: base,
-            } => {
-                archivo.seek(SeekFrom::Start(*base + dentro))?;
-                vmdk::leer_o_ceros(archivo, destino)?;
+        match &mut ext.data {
+            ExtentData::Flat { file, offset: base } => {
+                file.seek(SeekFrom::Start(*base + within))?;
+                vmdk::read_or_zeros(file, dst)?;
             }
-            DatosExtent::Sparse(sparse) => {
-                let leido = sparse.leer_en(dentro, destino)?;
-                destino[leido..].fill(0);
+            ExtentData::Sparse(sparse) => {
+                let read = sparse.read_at(within, dst)?;
+                dst[read..].fill(0);
             }
-            DatosExtent::Cero => destino.fill(0),
+            ExtentData::Zero => dst.fill(0),
         }
-        hecho += n;
+        done += n;
     }
     Ok(buf)
 }
 
-/// Intenta construir un backend nativo. Devuelve el motivo si hace falta `qemu-nbd`.
-fn abrir_nativo(info: &InfoImagen) -> io::Result<Apertura<(Backend, String)>> {
-    match info.formato.to_ascii_lowercase().as_str() {
-        "raw" => Ok(Apertura::Nativa((
-            Backend::Raw(abrir_archivo_lectura(&info.ruta)?),
+/// Attempts to construct a native backend. Returns the reason when `qemu-nbd` is required.
+fn open_native(info: &ImageInfo) -> io::Result<OpenResult<(Backend, String)>> {
+    match info.format.to_ascii_lowercase().as_str() {
+        "raw" => Ok(OpenResult::Native((
+            Backend::Raw(open_read_file(&info.path)?),
             "raw".to_string(),
         ))),
-        "vmdk" => abrir_vmdk_nativo(&info.ruta),
-        otro => Ok(Apertura::NecesitaNbd(format!("formato {}", otro))),
+        "vmdk" => open_vmdk_native(&info.path),
+        other => Ok(OpenResult::NeedsNbd(format!("format {}", other))),
     }
 }
 
-fn abrir_vmdk_nativo(ruta: &Path) -> io::Result<Apertura<(Backend, String)>> {
-    let mut archivo = abrir_archivo_lectura(ruta)?;
-    let mut cabecera = [0u8; 512];
-    let n = archivo.read(&mut cabecera)?;
-    let cabecera = &cabecera[..n];
+fn open_vmdk_native(path: &Path) -> io::Result<OpenResult<(Backend, String)>> {
+    let mut file = open_read_file(path)?;
+    let mut header = [0u8; 512];
+    let n = file.read(&mut header)?;
+    let header = &header[..n];
 
-    // --- Caso 1: monolithicSparse (cabecera binaria KDMV con descriptor embebido)
-    if vmdk::es_cabecera_sparse(cabecera) {
-        let cab = vmdk::leer_cabecera_sparse(cabecera)?;
+    // --- Case 1: monolithicSparse (binary KDMV header with embedded descriptor)
+    if vmdk::is_sparse_header(header) {
+        let cab = vmdk::read_sparse_header(header)?;
 
-        if cab.descriptor_offset != 0 && cab.descriptor_sectores != 0 {
-            let mut texto = vec![0u8; (cab.descriptor_sectores * SECTOR) as usize];
-            archivo.seek(SeekFrom::Start(cab.descriptor_offset * SECTOR))?;
-            vmdk::leer_o_ceros(&mut archivo, &mut texto)?;
-            let d = vmdk::parsear_descriptor(&String::from_utf8_lossy(&texto));
-            if d.tiene_padre() {
-                return Ok(Apertura::NecesitaNbd(
-                    "VMDK delta/snapshot con disco padre".to_string(),
+        if cab.descriptor_offset != 0 && cab.descriptor_sectors != 0 {
+            let mut text = vec![0u8; (cab.descriptor_sectors * SECTOR) as usize];
+            file.seek(SeekFrom::Start(cab.descriptor_offset * SECTOR))?;
+            vmdk::read_or_zeros(&mut file, &mut text)?;
+            let d = vmdk::parse_descriptor(&String::from_utf8_lossy(&text));
+            if d.has_parent() {
+                return Ok(OpenResult::NeedsNbd(
+                    "VMDK delta/snapshot with a parent disk".to_string(),
                 ));
             }
-            // Un sparse monolítico que declara varios extents es raro; delegar.
+            // A monolithic sparse declaring multiple extents is rare; delegate.
             if d.extents.len() > 1 {
-                return Ok(Apertura::NecesitaNbd(
-                    "VMDK sparse con múltiples extents declarados".to_string(),
+                return Ok(OpenResult::NeedsNbd(
+                    "VMDK sparse with multiple declared extents".to_string(),
                 ));
             }
         }
 
-        return Ok(match ExtentSparse::desde_cabecera(archivo, ruta, cab)? {
-            Apertura::Nativa(ext) => {
-                Apertura::Nativa((Backend::Sparse(ext), "vmdk monolithicSparse".to_string()))
+        return Ok(match SparseExtent::from_header(file, path, cab)? {
+            OpenResult::Native(ext) => {
+                OpenResult::Native((Backend::Sparse(ext), "vmdk monolithicSparse".to_string()))
             }
-            Apertura::NecesitaNbd(m) => Apertura::NecesitaNbd(m),
+            OpenResult::NeedsNbd(m) => OpenResult::NeedsNbd(m),
         });
     }
 
-    // --- Caso 2: descriptor de texto con extents externos
-    if vmdk::es_descriptor_texto(cabecera) {
-        let texto = fs::read_to_string(ruta)?;
-        let d = vmdk::parsear_descriptor(&texto);
-        if d.tiene_padre() {
-            return Ok(Apertura::NecesitaNbd(
-                "VMDK delta/snapshot con disco padre".to_string(),
+    // --- Case 2: text descriptor with external extents
+    if vmdk::is_text_descriptor(header) {
+        let text = fs::read_to_string(path)?;
+        let d = vmdk::parse_descriptor(&text);
+        if d.has_parent() {
+            return Ok(OpenResult::NeedsNbd(
+                "VMDK delta/snapshot with a parent disk".to_string(),
             ));
         }
         if d.extents.is_empty() {
-            return Ok(Apertura::NecesitaNbd(
-                "descriptor VMDK sin extents".to_string(),
+            return Ok(OpenResult::NeedsNbd(
+                "VMDK descriptor with no extents".to_string(),
             ));
         }
 
         let mut extents = Vec::with_capacity(d.extents.len());
-        let mut inicio = 0u64;
+        let mut start = 0u64;
         for e in &d.extents {
-            let longitud = e.sectores * SECTOR;
-            let datos = match e.tipo.as_str() {
-                "ZERO" => DatosExtent::Cero,
+            let length = e.sectors * SECTOR;
+            let data = match e.kind.as_str() {
+                "ZERO" => ExtentData::Zero,
                 "FLAT" | "VMFS" | "VMFSRAW" => {
-                    let Some(nombre) = &e.archivo else {
-                        return Ok(Apertura::NecesitaNbd("extent FLAT sin archivo".to_string()));
+                    let Some(name) = &e.file else {
+                        return Ok(OpenResult::NeedsNbd(
+                            "FLAT extent without a file".to_string(),
+                        ));
                     };
-                    let ruta_ext = vmdk::resolver_ruta_extent(ruta, nombre);
-                    DatosExtent::Plano {
-                        archivo: abrir_archivo_lectura(&ruta_ext).map_err(|err| {
+                    let ext_path = vmdk::resolve_extent_path(path, name);
+                    ExtentData::Flat {
+                        file: open_read_file(&ext_path).map_err(|err| {
                             io::Error::new(
                                 err.kind(),
-                                format!(
-                                    "No se pudo abrir el extent {}: {}",
-                                    ruta_ext.display(),
-                                    err
-                                ),
+                                format!("Could not open extent {}: {}", ext_path.display(), err),
                             )
                         })?,
-                        offset: e.offset_sectores * SECTOR,
+                        offset: e.offset_sectors * SECTOR,
                     }
                 }
                 "SPARSE" | "VMFSSPARSE" => {
-                    let Some(nombre) = &e.archivo else {
-                        return Ok(Apertura::NecesitaNbd(
-                            "extent SPARSE sin archivo".to_string(),
+                    let Some(name) = &e.file else {
+                        return Ok(OpenResult::NeedsNbd(
+                            "SPARSE extent without a file".to_string(),
                         ));
                     };
-                    let ruta_ext = vmdk::resolver_ruta_extent(ruta, nombre);
-                    match ExtentSparse::abrir(&ruta_ext)? {
-                        Apertura::Nativa(s) => DatosExtent::Sparse(s),
-                        Apertura::NecesitaNbd(m) => return Ok(Apertura::NecesitaNbd(m)),
+                    let ext_path = vmdk::resolve_extent_path(path, name);
+                    match SparseExtent::open(&ext_path)? {
+                        OpenResult::Native(s) => ExtentData::Sparse(s),
+                        OpenResult::NeedsNbd(m) => return Ok(OpenResult::NeedsNbd(m)),
                     }
                 }
-                otro => {
-                    return Ok(Apertura::NecesitaNbd(format!(
-                        "extent VMDK de tipo {} no soportado",
-                        otro
+                other => {
+                    return Ok(OpenResult::NeedsNbd(format!(
+                        "VMDK extent of type {} is not supported",
+                        other
                     )));
                 }
             };
-            extents.push(ExtentAbierto {
-                inicio,
-                longitud,
-                datos,
+            extents.push(OpenExtent {
+                start,
+                length,
+                data,
             });
-            inicio += longitud;
+            start += length;
         }
 
         let tipo = if d.create_type.is_empty() {
@@ -631,169 +626,169 @@ fn abrir_vmdk_nativo(ruta: &Path) -> io::Result<Apertura<(Backend, String)>> {
         } else {
             d.create_type.clone()
         };
-        return Ok(Apertura::Nativa((
+        return Ok(OpenResult::Native((
             Backend::Extents(extents),
             format!("vmdk {}", tipo),
         )));
     }
 
-    Ok(Apertura::NecesitaNbd(
-        "VMDK con cabecera no reconocida".to_string(),
+    Ok(OpenResult::NeedsNbd(
+        "VMDK with unrecognized header".to_string(),
     ))
 }
 
 // -----------------------------------------------------------------------------
-// Disco virtual con Read + Seek y caché de chunks
+// Virtual disk with Read + Seek and chunk cache
 // -----------------------------------------------------------------------------
 
-/// Vista `Read + Seek` de un rango del disco virtual (normalmente una partición).
+/// `Read + Seek` view of a virtual disk range (typically a single partition).
 ///
-/// Los accesos se agrupan en chunks alineados de `tamano_chunk` bytes que se
-/// obtienen bajo demanda con [`VmDriver`] y se conservan en una caché LRU.
-pub struct DiscoVirtual<'a> {
+/// Reads are grouped into aligned chunks of `chunk_size` bytes that are
+/// fetched on demand via [`VmDriver`] and kept in an LRU chunk cache.
+pub struct VirtualDisk<'a> {
     driver: &'a dyn VmDriver,
     base: u64,
-    longitud: u64,
-    posicion: u64,
-    tamano_chunk: u64,
+    length: u64,
+    position: u64,
+    chunk_size: u64,
     cache: RefCell<VecDeque<(u64, Vec<u8>)>>,
     max_chunks: usize,
 }
 
-impl<'a> DiscoVirtual<'a> {
-    /// Crea una vista sobre `[base, base+longitud)` del disco.
-    pub fn new(driver: &'a dyn VmDriver, base: u64, longitud: u64, tamano_chunk: u64) -> Self {
-        let tamano_chunk = tamano_chunk.max(512).next_power_of_two();
+impl<'a> VirtualDisk<'a> {
+    /// Creates a view over `[base, base+length)` of the disk.
+    pub fn new(driver: &'a dyn VmDriver, base: u64, length: u64, chunk_size: u64) -> Self {
+        let chunk_size = chunk_size.max(512).next_power_of_two();
         Self {
             driver,
             base,
-            longitud,
-            posicion: 0,
-            tamano_chunk,
+            length,
+            position: 0,
+            chunk_size,
             cache: RefCell::new(VecDeque::new()),
-            // ~64 MiB de caché independientemente del tamaño de chunk.
-            max_chunks: ((64 * 1024 * 1024) / tamano_chunk).clamp(4, 512) as usize,
+            // ~64 MiB of cache regardless of the chunk size.
+            max_chunks: ((64 * 1024 * 1024) / chunk_size).clamp(4, 512) as usize,
         }
     }
 
-    /// Vista sobre el disco completo.
-    pub fn completo(driver: &'a dyn VmDriver, tamano_chunk: u64) -> Self {
-        Self::new(driver, 0, driver.tamano_virtual(), tamano_chunk)
+    /// View over the entire disk.
+    pub fn full(driver: &'a dyn VmDriver, chunk_size: u64) -> Self {
+        Self::new(driver, 0, driver.virtual_size(), chunk_size)
     }
 
-    /// Devuelve la longitud en bytes del rango mapeado.
-    pub fn longitud(&self) -> u64 {
-        self.longitud
+    /// Returns the length, in bytes, of the mapped range.
+    pub fn length(&self) -> u64 {
+        self.length
     }
 
-    /// Devuelve el desplazamiento base en bytes dentro del disco virtual.
+    /// Returns the base offset, in bytes, within the virtual disk.
     pub fn base(&self) -> u64 {
         self.base
     }
 
-    /// Lee datos atendiendo desde la caché de chunks LRU y cargando bloques alineados si no están en memoria.
-    fn leer_con_cache(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
-        if pos >= self.longitud || buf.is_empty() {
+    /// Reads data through the LRU chunk cache, loading aligned blocks on demand when missing.
+    fn read_with_cache(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if pos >= self.length || buf.is_empty() {
             return Ok(0);
         }
-        let total = (self.longitud - pos).min(buf.len() as u64) as usize;
-        let mut transferidos = 0;
+        let total = (self.length - pos).min(buf.len() as u64) as usize;
+        let mut transferred = 0;
 
-        while transferidos < total {
-            let offset_actual = pos + transferidos as u64;
-            let indice_chunk = offset_actual / self.tamano_chunk;
-            let dentro_chunk = (offset_actual % self.tamano_chunk) as usize;
+        while transferred < total {
+            let current_offset = pos + transferred as u64;
+            let chunk_index = current_offset / self.chunk_size;
+            let within_chunk = (current_offset % self.chunk_size) as usize;
 
-            // Asegurar que el chunk requerido esté en el frente de la caché
+            // Make sure the required chunk sits at the front of the cache.
             {
                 let mut cache = self.cache.borrow_mut();
-                if let Some(p) = cache.iter().position(|(i, _)| *i == indice_chunk) {
+                if let Some(p) = cache.iter().position(|(i, _)| *i == chunk_index) {
                     if p > 0 {
-                        if let Some(entrada) = cache.remove(p) {
-                            cache.push_front(entrada);
+                        if let Some(entry) = cache.remove(p) {
+                            cache.push_front(entry);
                         }
                     }
                 } else {
-                    // Cargar chunk desde el driver liberando momentáneamente el borrow de la caché
+                    // Load the chunk from the driver, briefly releasing the cache borrow.
                     drop(cache);
-                    let abs = self.base + indice_chunk * self.tamano_chunk;
-                    let len_chunk = self.tamano_chunk as usize;
-                    let mut leidos = vec![0u8; len_chunk];
-                    let total_virtual = self.driver.tamano_virtual();
+                    let abs = self.base + chunk_index * self.chunk_size;
+                    let chunk_len = self.chunk_size as usize;
+                    let mut read = vec![0u8; chunk_len];
+                    let total_virtual = self.driver.virtual_size();
                     if abs < total_virtual {
-                        let a_leer = len_chunk.min((total_virtual - abs) as usize);
-                        leidos.truncate(a_leer);
+                        let to_read = chunk_len.min((total_virtual - abs) as usize);
+                        read.truncate(to_read);
                         self.driver
-                            .leer_rango(abs, &mut leidos)
+                            .read_range(abs, &mut read)
                             .map_err(|e| io::Error::other(e.to_string()))?;
                     } else {
-                        leidos.clear();
+                        read.clear();
                     }
                     let mut cache = self.cache.borrow_mut();
                     if cache.len() >= self.max_chunks {
                         cache.pop_back();
                     }
-                    cache.push_front((indice_chunk, leidos));
+                    cache.push_front((chunk_index, read));
                 }
             }
 
             let cache = self.cache.borrow();
-            let (_, datos) = &cache[0];
+            let (_, data) = &cache[0];
 
-            if dentro_chunk >= datos.len() {
+            if within_chunk >= data.len() {
                 break;
             }
 
-            let disponibles = datos.len() - dentro_chunk;
-            let a_copiar = (total - transferidos).min(disponibles);
-            buf[transferidos..transferidos + a_copiar]
-                .copy_from_slice(&datos[dentro_chunk..dentro_chunk + a_copiar]);
-            transferidos += a_copiar;
+            let available = data.len() - within_chunk;
+            let to_copy = (total - transferred).min(available);
+            buf[transferred..transferred + to_copy]
+                .copy_from_slice(&data[within_chunk..within_chunk + to_copy]);
+            transferred += to_copy;
         }
 
-        Ok(transferidos)
+        Ok(transferred)
     }
 }
 
-impl Read for DiscoVirtual<'_> {
+impl Read for VirtualDisk<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.leer_con_cache(self.posicion, buf)?;
-        self.posicion += n as u64;
+        let n = self.read_with_cache(self.position, buf)?;
+        self.position += n as u64;
         Ok(n)
     }
 }
 
-impl Seek for DiscoVirtual<'_> {
+impl Seek for VirtualDisk<'_> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let nueva = match pos {
+        let new = match pos {
             SeekFrom::Start(p) => p as i128,
-            SeekFrom::End(d) => self.longitud as i128 + d as i128,
-            SeekFrom::Current(d) => self.posicion as i128 + d as i128,
+            SeekFrom::End(d) => self.length as i128 + d as i128,
+            SeekFrom::Current(d) => self.position as i128 + d as i128,
         };
-        if nueva < 0 {
+        if new < 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "seek a una posición negativa",
+                "seek to a negative position",
             ));
         }
-        self.posicion = nueva as u64;
-        Ok(self.posicion)
+        self.position = new as u64;
+        Ok(self.position)
     }
 }
 
-impl<'a> ReadAt for DiscoVirtual<'a> {
+impl<'a> ReadAt for VirtualDisk<'a> {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
-        self.leer_con_cache(pos, buf)
+        self.read_with_cache(pos, buf)
     }
 }
 
-impl<'a> MemoryMapper for DiscoVirtual<'a> {
-    fn leer_en_offset(&mut self, offset: u64, buf: &mut [u8]) -> crate::error::Result<usize> {
-        self.leer_con_cache(offset, buf).map_err(Into::into)
+impl<'a> MemoryMapper for VirtualDisk<'a> {
+    fn read_at_offset(&mut self, offset: u64, buf: &mut [u8]) -> crate::error::Result<usize> {
+        self.read_with_cache(offset, buf).map_err(Into::into)
     }
 
-    fn longitud(&self) -> u64 {
-        self.longitud
+    fn length(&self) -> u64 {
+        self.length
     }
 }
 
@@ -803,7 +798,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn test_disco_virtual_read_seek() {
+    fn test_virtual_disk_read_seek() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("test_disk.raw");
         {
@@ -815,54 +810,51 @@ mod tests {
             f.write_all(&data).unwrap();
         }
 
-        let info = InfoImagen {
-            ruta: file_path.clone(),
-            formato: "raw".to_string(),
-            tamano_virtual: 4096,
-            tamano_real: 4096,
-            hipervisor: Hipervisor::Desconocido,
+        let info = ImageInfo {
+            path: file_path.clone(),
+            format: "raw".to_string(),
+            virtual_size: 4096,
+            actual_size: 4096,
+            hypervisor: Hypervisor::Unknown,
         };
 
-        let lector = LectorDisco::abrir(None, &info, None).unwrap();
-        assert!(lector.es_nativo());
-        assert_eq!(lector.tamano_virtual(), 4096);
+        let reader = DiskReader::open(None, &info, None).unwrap();
+        assert!(reader.is_native());
+        assert_eq!(reader.virtual_size(), 4096);
 
-        let mut disco = DiscoVirtual::new(&lector, 0, 4096, 512);
-        assert_eq!(disco.base(), 0);
-        assert_eq!(disco.longitud(), 4096);
+        let mut disk = VirtualDisk::new(&reader, 0, 4096, 512);
+        assert_eq!(disk.base(), 0);
+        assert_eq!(disk.length(), 4096);
 
-        let disco_completo = DiscoVirtual::completo(&lector, 512);
-        assert_eq!(disco_completo.base(), 0);
-        assert_eq!(disco_completo.longitud(), 4096);
+        let full_disk = VirtualDisk::full(&reader, 512);
+        assert_eq!(full_disk.base(), 0);
+        assert_eq!(full_disk.length(), 4096);
 
         // Read first 8 bytes
         let mut buf = [0u8; 8];
-        disco.read_exact(&mut buf).unwrap();
+        disk.read_exact(&mut buf).unwrap();
         assert_eq!(&buf[0..4], &0u32.to_le_bytes());
         assert_eq!(&buf[4..8], &1u32.to_le_bytes());
 
         // Seek
-        disco.seek(SeekFrom::Start(100 * 4)).unwrap();
-        disco.read_exact(&mut buf[0..4]).unwrap();
+        disk.seek(SeekFrom::Start(100 * 4)).unwrap();
+        disk.read_exact(&mut buf[0..4]).unwrap();
         assert_eq!(&buf[0..4], &100u32.to_le_bytes());
 
         // ReadAt
         let mut read_at_buf = [0u8; 4];
-        let n = disco.read_at(250 * 4, &mut read_at_buf).unwrap();
+        let n = disk.read_at(250 * 4, &mut read_at_buf).unwrap();
         assert_eq!(n, 4);
         assert_eq!(&read_at_buf, &250u32.to_le_bytes());
     }
 
     #[test]
-    fn test_formato_por_extension() {
-        assert_eq!(formato_por_extension(Path::new("test.vmdk")), Some("vmdk"));
-        assert_eq!(
-            formato_por_extension(Path::new("test.qcow2")),
-            Some("qcow2")
-        );
-        assert_eq!(formato_por_extension(Path::new("test.vdi")), Some("vdi"));
-        assert_eq!(formato_por_extension(Path::new("test.vhdx")), Some("vhdx"));
-        assert_eq!(formato_por_extension(Path::new("test.raw")), Some("raw"));
-        assert_eq!(formato_por_extension(Path::new("test.xyz")), None);
+    fn test_format_by_extension() {
+        assert_eq!(format_by_extension(Path::new("test.vmdk")), Some("vmdk"));
+        assert_eq!(format_by_extension(Path::new("test.qcow2")), Some("qcow2"));
+        assert_eq!(format_by_extension(Path::new("test.vdi")), Some("vdi"));
+        assert_eq!(format_by_extension(Path::new("test.vhdx")), Some("vhdx"));
+        assert_eq!(format_by_extension(Path::new("test.raw")), Some("raw"));
+        assert_eq!(format_by_extension(Path::new("test.xyz")), None);
     }
 }

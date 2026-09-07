@@ -1,58 +1,58 @@
-//! Traits y contratos abstractos independientes del hipervisor o sistema operativo.
+//! Traits and abstract contracts independent of the hypervisor or operating system.
 
 use crate::error::Result;
-use crate::models::{Opciones, Particion, Programa, VMInfo};
+use crate::models::{GuestInfo, Options, Partition, Program};
 use std::io::{Read, Seek};
 
-/// Resultado consolidado devuelto por la inspección de un sistema operativo.
+/// Consolidated result returned by the inspection of an operating system.
 #[derive(Debug, Clone, Default)]
-pub struct ResultadoAnalisis {
-    /// Información detallada del sistema operativo detectado.
-    pub vm_info: VMInfo,
-    /// Lista de programas y paquetes identificados.
-    pub programas: Vec<Programa>,
-    /// Advertencias no fatales recolectadas durante el análisis (ej. colmenas del
-    /// Registro de Windows corruptas o "sucias" de las que se degradó con gracia).
-    pub advertencias: Vec<String>,
+pub struct AnalysisResult {
+    /// Detailed information about the detected operating system.
+    pub guest_info: GuestInfo,
+    /// List of identified programs and packages.
+    pub programs: Vec<Program>,
+    /// Non-fatal warnings collected during the analysis (e.g. Windows Registry
+    /// hives that were corrupt or dirty and from which we gracefully degraded).
+    pub warnings: Vec<String>,
 }
 
-/// Contrato abstracto para drivers de acceso a imágenes de máquinas virtuales o hipervisores.
+/// Abstract contract for drivers that access virtual machine images or hypervisors.
 pub trait VmDriver {
-    /// Devuelve el tamaño virtual total del disco en bytes.
-    fn tamano_virtual(&self) -> u64;
+    /// Returns the total virtual size of the disk in bytes.
+    fn virtual_size(&self) -> u64;
 
-    /// Lee un rango de bytes desde el desplazamiento `offset` virtual hasta llenar `buf`.
-    fn leer_rango(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    /// Reads a byte range from the virtual `offset` until `buf` is filled.
+    fn read_range(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
 
-    /// Nombre o descripción del modo de acceso utilizado por el driver.
-    fn modo_acceso(&self) -> &str;
+    /// Name or description of the access mode used by the driver.
+    fn access_mode(&self) -> &str;
 
-    /// Indica si el driver opera de forma nativa en Rust sin subprocesos externos.
-    fn es_nativo(&self) -> bool;
+    /// Indicates whether the driver operates natively in Rust without external subprocesses.
+    fn is_native(&self) -> bool;
 
-    /// Tamaño de chunk recomendado para operaciones en bloque con este driver.
-    fn tamano_chunk_recomendado(&self) -> u64 {
+    /// Recommended chunk size for block-oriented operations with this driver.
+    fn recommended_chunk_size(&self) -> u64 {
         1024 * 1024
     }
 }
 
-/// Contrato abstracto para mapeadores de memoria, bloques o rangos de disco virtual.
+/// Abstract contract for memory, block or virtual disk range mappers.
 pub trait MemoryMapper: Read + Seek {
-    /// Lee un bloque de datos en un desplazamiento absoluto `offset` dentro del espacio mapeado.
-    fn leer_en_offset(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+    /// Reads a block of data at an absolute `offset` within the mapped space.
+    fn read_at_offset(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 
-    /// Devuelve la longitud total del espacio mapeado.
-    fn longitud(&self) -> u64;
+    /// Returns the total length of the mapped space.
+    fn length(&self) -> u64;
 }
 
-/// Contrato abstracto para analizadores de sistemas operativos invitados (Windows, Linux, etc.).
-pub trait InspectorOS {
-    /// Ejecuta el análisis del sistema de archivos y extrae la información del SO y software instalado.
-    fn analizar(
+/// Abstract contract for guest operating system analyzers (Windows, Linux, etc.).
+pub trait OsInspector {
+    /// Runs the file system analysis and extracts the OS info and installed software.
+    fn analyze(
         &self,
         driver: &dyn VmDriver,
-        particiones: &[Particion],
-        tamano_chunk: u64,
-        opciones: &Opciones,
-    ) -> Result<ResultadoAnalisis>;
+        partitions: &[Partition],
+        chunk_size: u64,
+        options: &Options,
+    ) -> Result<AnalysisResult>;
 }

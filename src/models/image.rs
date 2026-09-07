@@ -1,88 +1,89 @@
-//! Modelos relacionados con imágenes de disco, hipervisores y estadísticas de inspección.
+//! Models for disk images, hypervisors and inspection statistics.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Hipervisor de origen, inferido del formato de la imagen de disco.
+/// Source hypervisor inferred from the disk image format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Hipervisor {
-    /// VMware ESXi, Workstation o Fusion.
+pub enum Hypervisor {
+    /// VMware ESXi, Workstation or Fusion.
     VMware,
     /// Oracle VirtualBox.
     VirtualBox,
-    /// Microsoft Hyper-V o Virtual PC.
+    /// Microsoft Hyper-V or Virtual PC.
     HyperV,
     /// QEMU / KVM.
     Qemu,
-    /// Hipervisor o formato de origen desconocido.
-    Desconocido,
+    /// Unknown hypervisor or origin format.
+    Unknown,
 }
 
-impl Hipervisor {
-    /// Deduce el hipervisor a partir de la extensión o nombre de formato devuelto por la inspección.
-    pub fn desde_formato(formato: &str) -> Self {
-        match formato.to_ascii_lowercase().as_str() {
-            "vmdk" => Hipervisor::VMware,
-            "vdi" => Hipervisor::VirtualBox,
-            "vpc" | "vhd" | "vhdx" => Hipervisor::HyperV,
-            "qcow" | "qcow2" | "qed" => Hipervisor::Qemu,
-            _ => Hipervisor::Desconocido,
+impl Hypervisor {
+    /// Deduces the hypervisor from the extension or format name returned by inspection.
+    pub fn from_format(format: &str) -> Self {
+        match format.to_ascii_lowercase().as_str() {
+            "vmdk" => Hypervisor::VMware,
+            "vdi" => Hypervisor::VirtualBox,
+            "vpc" | "vhd" | "vhdx" => Hypervisor::HyperV,
+            "qcow" | "qcow2" | "qed" => Hypervisor::Qemu,
+            _ => Hypervisor::Unknown,
         }
     }
 
-    /// Nombre descriptivo del hipervisor.
-    pub fn nombre(&self) -> &'static str {
+    /// Human-readable hypervisor name.
+    pub fn name(&self) -> &'static str {
         match self {
-            Hipervisor::VMware => "VMware",
-            Hipervisor::VirtualBox => "VirtualBox",
-            Hipervisor::HyperV => "Hyper-V / Virtual PC",
-            Hipervisor::Qemu => "QEMU / KVM",
-            Hipervisor::Desconocido => "Desconocido (imagen raw u otro)",
+            Hypervisor::VMware => "VMware",
+            Hypervisor::VirtualBox => "VirtualBox",
+            Hypervisor::HyperV => "Hyper-V / Virtual PC",
+            Hypervisor::Qemu => "QEMU / KVM",
+            Hypervisor::Unknown => "Unknown (raw image or other)",
         }
     }
 }
 
-/// Información descriptiva y dimensiones de la imagen de disco examinada.
+/// Descriptive information and dimensions of the examined disk image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InfoImagen {
-    /// Ruta del archivo de disco en el sistema de archivos host.
-    pub ruta: PathBuf,
-    /// Formato detectado (ej. "vmdk", "vdi", "vhdx", "qcow2", "raw").
-    pub formato: String,
-    /// Capacidad total expresada por el disco virtual en bytes.
-    pub tamano_virtual: u64,
-    /// Tamaño físico realmente ocupado en disco por el archivo de la imagen en bytes.
-    pub tamano_real: u64,
-    /// Hipervisor asociado a la imagen.
-    pub hipervisor: Hipervisor,
+pub struct ImageInfo {
+    /// Path of the disk file on the host file system.
+    pub path: PathBuf,
+    /// Detected format (e.g. "vmdk", "vdi", "vhdx", "qcow2", "raw").
+    pub format: String,
+    /// Total virtual capacity reported by the virtual disk, in bytes.
+    pub virtual_size: u64,
+    /// Actual physical size occupied on disk by the image file, in bytes.
+    pub actual_size: u64,
+    /// Hypervisor associated with the image.
+    pub hypervisor: Hypervisor,
 }
 
-/// Estadísticas y métricas de rendimiento recolectadas durante el proceso de inspección.
+/// Performance statistics and metrics collected during the inspection process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Estadisticas {
-    /// Descripción del backend de acceso empleado (ej. "nativo (...)" o "qemu-nbd tcp (...)").
-    pub modo_acceso: String,
-    /// Cantidad de peticiones realizadas al backend de lectura (socket NBD en modo virtualizado).
-    pub peticiones_nbd: u64,
-    /// Cantidad total de bytes extraídos físicamente desde el disco virtual.
-    pub bytes_leidos: u64,
-    /// Tiempo total que tomó el proceso de inspección expresado en milisegundos.
-    pub duracion_ms: u64,
+pub struct Stats {
+    /// Description of the access backend used (e.g. "native (...)" or "qemu-nbd tcp (...)").
+    pub access_mode: String,
+    /// Number of requests issued to the read backend (NBD socket in virtualized mode).
+    pub nbd_requests: u64,
+    /// Total number of bytes physically extracted from the virtual disk.
+    pub bytes_read: u64,
+    /// Total time the inspection process took, expressed in milliseconds.
+    pub duration_ms: u64,
 }
 
-/// Función utilitaria que convierte un valor entero en bytes a una representación léxica formateada (B, KiB, MiB, GiB, TiB).
-pub fn formatear_bytes(bytes: u64) -> String {
-    const UNIDADES: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut valor = bytes as f64;
+/// Utility function that converts an integer byte count into a lexical formatted
+/// representation (B, KiB, MiB, GiB, TiB).
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
     let mut idx = 0;
-    while valor >= 1024.0 && idx < UNIDADES.len() - 1 {
-        valor /= 1024.0;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
         idx += 1;
     }
     if idx == 0 {
-        format!("{} {}", bytes, UNIDADES[idx])
+        format!("{} {}", bytes, UNITS[idx])
     } else {
-        format!("{:.1} {}", valor, UNIDADES[idx])
+        format!("{:.1} {}", value, UNITS[idx])
     }
 }
 
@@ -91,19 +92,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_formatear_bytes() {
-        assert_eq!(formatear_bytes(500), "500 B");
-        assert_eq!(formatear_bytes(1024), "1.0 KiB");
-        assert_eq!(formatear_bytes(1024 * 1024), "1.0 MiB");
-        assert_eq!(formatear_bytes(1024 * 1024 * 1024 * 2), "2.0 GiB");
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 2), "2.0 GiB");
     }
 
     #[test]
-    fn test_hipervisor_desde_formato() {
-        assert_eq!(Hipervisor::desde_formato("vmdk"), Hipervisor::VMware);
-        assert_eq!(Hipervisor::desde_formato("vdi"), Hipervisor::VirtualBox);
-        assert_eq!(Hipervisor::desde_formato("vhdx"), Hipervisor::HyperV);
-        assert_eq!(Hipervisor::desde_formato("qcow2"), Hipervisor::Qemu);
-        assert_eq!(Hipervisor::desde_formato("raw"), Hipervisor::Desconocido);
+    fn test_hypervisor_from_format() {
+        assert_eq!(Hypervisor::from_format("vmdk"), Hypervisor::VMware);
+        assert_eq!(Hypervisor::from_format("vdi"), Hypervisor::VirtualBox);
+        assert_eq!(Hypervisor::from_format("vhdx"), Hypervisor::HyperV);
+        assert_eq!(Hypervisor::from_format("qcow2"), Hypervisor::Qemu);
+        assert_eq!(Hypervisor::from_format("raw"), Hypervisor::Unknown);
     }
 }

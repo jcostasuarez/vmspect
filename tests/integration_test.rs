@@ -3,134 +3,134 @@ use std::sync::Arc;
 use vmspect::prelude::*;
 
 #[test]
-fn test_opciones_defaults_y_helpers() {
-    // a) Por defecto (sin banderas): debe analizar sistema y aplicaciones
-    let opc = Opciones::default();
-    assert!(!opc.noapps, "Por defecto noapps debe ser false");
-    assert!(!opc.nosystem, "Por defecto nosystem debe ser false");
+fn test_options_defaults_and_helpers() {
+    // a) By default (no flags): both system and apps should be analyzed
+    let opts = Options::default();
+    assert!(!opts.no_apps, "By default no_apps must be false");
+    assert!(!opts.no_system, "By default no_system must be false");
     assert!(
-        opc.debe_analizar_apps(),
-        "Por defecto debe_analizar_apps() debe retornar true"
+        opts.should_analyze_apps(),
+        "By default should_analyze_apps() must return true"
     );
     assert!(
-        opc.debe_analizar_sistema(),
-        "Por defecto debe_analizar_sistema() debe retornar true"
-    );
-
-    // b) Con --noapps: extrae sistema, omite aplicaciones
-    let opc_noapps = Opciones {
-        noapps: true,
-        ..Opciones::default()
-    };
-    assert!(
-        !opc_noapps.debe_analizar_apps(),
-        "Con noapps=true, debe_analizar_apps() debe retornar false"
-    );
-    assert!(
-        opc_noapps.debe_analizar_sistema(),
-        "Con noapps=true, debe_analizar_sistema() debe permanecer true"
+        opts.should_analyze_system(),
+        "By default should_analyze_system() must return true"
     );
 
-    // c) Con --nosystem: extrae aplicaciones, omite sistema
-    let opc_nosystem = Opciones {
-        nosystem: true,
-        ..Opciones::default()
+    // b) With --no-apps: extract system, skip apps
+    let opts_no_apps = Options {
+        no_apps: true,
+        ..Options::default()
     };
     assert!(
-        opc_nosystem.debe_analizar_apps(),
-        "Con nosystem=true, debe_analizar_apps() debe permanecer true"
+        !opts_no_apps.should_analyze_apps(),
+        "With no_apps=true, should_analyze_apps() must return false"
     );
     assert!(
-        !opc_nosystem.debe_analizar_sistema(),
-        "Con nosystem=true, debe_analizar_sistema() debe retornar false"
+        opts_no_apps.should_analyze_system(),
+        "With no_apps=true, should_analyze_system() must remain true"
     );
 
-    // d) Con ambas banderas (--noapps y --nosystem)
-    let opc_ambas = Opciones {
-        noapps: true,
-        nosystem: true,
-        ..Opciones::default()
+    // c) With --no-system: extract apps, skip system
+    let opts_no_system = Options {
+        no_system: true,
+        ..Options::default()
     };
-    assert!(!opc_ambas.debe_analizar_apps());
-    assert!(!opc_ambas.debe_analizar_sistema());
+    assert!(
+        opts_no_system.should_analyze_apps(),
+        "With no_system=true, should_analyze_apps() must remain true"
+    );
+    assert!(
+        !opts_no_system.should_analyze_system(),
+        "With no_system=true, should_analyze_system() must return false"
+    );
+
+    // d) With both flags (--no-apps and --no-system)
+    let opts_both = Options {
+        no_apps: true,
+        no_system: true,
+        ..Options::default()
+    };
+    assert!(!opts_both.should_analyze_apps());
+    assert!(!opts_both.should_analyze_system());
 }
 
 #[test]
-fn test_opciones_inspeccion_alias_y_builder() {
+fn test_inspection_options_alias_and_builder() {
     let token = Arc::new(AtomicBool::new(false));
-    let opc: OpcionesInspeccion = OpcionesInspeccion::default().with_cancel_token(token.clone());
-    assert!(opc.cancel_token.is_some());
+    let opts: InspectionOptions = InspectionOptions::default().with_cancel_token(token.clone());
+    assert!(opts.cancel_token.is_some());
 
     let ctoken = CancellationToken::new();
-    let opc2 = Opciones::default()
+    let opts2 = Options::default()
         .with_cancellation_token(&ctoken)
         .with_qemu_nbd(std::path::PathBuf::from("/usr/bin/qemu-nbd"))
-        .with_forzar_nbd(true)
-        .with_socket_unix("/var/run/qemu-test.sock")
+        .with_force_nbd(true)
+        .with_unix_socket("/var/run/qemu-test.sock")
         .with_extra_nbd_args(vec!["--cache=none".into(), "--detect-zeroes=on".into()])
         .with_connection_timeout(std::time::Duration::from_secs(5))
-        .with_persistente_nbd(false);
+        .with_nbd_persistent(false);
 
-    assert!(opc2.cancel_token.is_some());
+    assert!(opts2.cancel_token.is_some());
     assert_eq!(
-        opc2.qemu_nbd,
+        opts2.qemu_nbd,
         Some(std::path::PathBuf::from("/usr/bin/qemu-nbd"))
     );
-    assert!(opc2.forzar_nbd);
+    assert!(opts2.force_nbd);
     assert_eq!(
-        opc2.socket_unix,
+        opts2.unix_socket,
         Some(std::path::PathBuf::from("/var/run/qemu-test.sock"))
     );
     assert_eq!(
-        opc2.args_extra_nbd,
+        opts2.extra_nbd_args,
         vec!["--cache=none".to_string(), "--detect-zeroes=on".to_string()]
     );
     assert_eq!(
-        opc2.timeout_conexion,
+        opts2.connection_timeout,
         Some(std::time::Duration::from_secs(5))
     );
-    assert!(!opc2.persistente_nbd);
+    assert!(!opts2.nbd_persistent);
 }
 
 #[test]
-fn test_qemu_not_found_cuando_se_requiere_nbd() {
+fn test_qemu_not_found_when_nbd_is_required() {
     let dir = tempfile::tempdir().unwrap();
     let qcow2_path = dir.path().join("server.qcow2");
     let mut f1 = std::fs::File::create(&qcow2_path).unwrap();
     use std::io::Write;
     f1.write_all(b"QFI\xfb\x00\x00\x00\x03").unwrap();
 
-    let opciones = Opciones {
-        qemu_nbd: Some(std::path::PathBuf::from("ruta_inexistente_qemu_nbd")),
-        ..Opciones::default()
+    let options = Options {
+        qemu_nbd: Some(std::path::PathBuf::from("nonexistent_qemu_nbd_path")),
+        ..Options::default()
     };
-    let motor = MotorInspeccion::new(opciones);
+    let engine = InspectionEngine::new(options);
 
-    let res = motor.inspeccionar(&qcow2_path);
-    assert!(res.is_err(), "Debe fallar por no encontrar qemu-nbd");
+    let res = engine.inspect(&qcow2_path);
+    assert!(res.is_err(), "Should fail because qemu-nbd cannot be found");
     match res {
         Err(VmSpectError::QemuNotFound(msg)) => {
             assert!(
-                msg.contains("No se encontró el ejecutable qemu-nbd en el sistema"),
-                "Mensaje inesperado: {}",
+                msg.contains("qemu-nbd executable was not found on the system"),
+                "Unexpected message: {}",
                 msg
             );
         }
-        other => panic!("Esperado VmSpectError::QemuNotFound, recibido: {:?}", other),
+        other => panic!("Expected VmSpectError::QemuNotFound, got: {:?}", other),
     }
 }
 
 #[test]
-fn test_procesador_concurrente_preservacion_parcial_en_cancelacion() {
+fn test_concurrent_processor_partial_preservation_on_cancellation() {
     use std::thread::sleep;
     use std::time::Duration;
 
     let items: Vec<u32> = (1..=30).collect();
     let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_clon = cancel.clone();
+    let cancel_clone = cancel.clone();
 
     let handle = std::thread::spawn(move || {
-        ProcesadorConcurrente::procesar_en_paralelo(items, Some(cancel_clon), None, 4, |item| {
+        ConcurrentProcessor::process_in_parallel(items, Some(cancel_clone), None, 4, |item| {
             if item >= 3 {
                 sleep(Duration::from_millis(40));
             }
@@ -141,99 +141,97 @@ fn test_procesador_concurrente_preservacion_parcial_en_cancelacion() {
     sleep(Duration::from_millis(15));
     cancel.store(true, std::sync::atomic::Ordering::Release);
 
-    let res = handle.join().expect("hilo finalizado");
-    let resultados = res.expect("debe preservar resultados parciales");
+    let res = handle.join().expect("thread finished");
+    let results = res.expect("must preserve partial results");
     assert!(
-        !resultados.is_empty(),
-        "Debe contener los resultados finalizados antes de la cancelación"
+        !results.is_empty(),
+        "Must contain the results finished before cancellation"
     );
     assert!(
-        resultados.len() < 30,
-        "No deben haberse procesado todos los items"
+        results.len() < 30,
+        "Not all items should have been processed"
     );
-    for r in &resultados {
+    for r in &results {
         assert_eq!(r % 10, 0);
     }
 }
 
 #[test]
-fn test_extraccion_agnostica_sin_reglas_ni_filtros() {
-    // d) Extracción agnóstica: verifica que las aplicaciones no sean filtradas por listas de ruido
-    // ni categorizaciones propietarias.
-    let paquetes_muestra = [
-        Programa {
-            nombre: "libc6".to_string(),
+fn test_agnostic_extraction_without_rules_or_filters() {
+    // d) Agnostic extraction: verifies that applications are not filtered by noise lists
+    // nor by proprietary categorizations.
+    let sample_packages = [
+        Program {
+            name: "libc6".to_string(),
             version: Some("2.35-0ubuntu3".to_string()),
-            editor: Some("libs".to_string()),
-            origen: None,
+            publisher: Some("libs".to_string()),
+            source: None,
         },
-        Programa {
-            nombre: "python3-minimal".to_string(),
+        Program {
+            name: "python3-minimal".to_string(),
             version: Some("3.10.6-1".to_string()),
-            editor: Some("python".to_string()),
-            origen: None,
+            publisher: Some("python".to_string()),
+            source: None,
         },
-        Programa {
-            nombre: "libssl3".to_string(),
+        Program {
+            name: "libssl3".to_string(),
             version: Some("3.0.2-0ubuntu1".to_string()),
-            editor: Some("libs".to_string()),
-            origen: None,
+            publisher: Some("libs".to_string()),
+            source: None,
         },
-        Programa {
-            nombre: "linux-image-5.15.0-generic".to_string(),
+        Program {
+            name: "linux-image-5.15.0-generic".to_string(),
             version: Some("5.15.0-88.98".to_string()),
-            editor: Some("kernel".to_string()),
-            origen: None,
+            publisher: Some("kernel".to_string()),
+            source: None,
         },
-        Programa {
-            nombre: "Siemens TIA Portal V18".to_string(),
+        Program {
+            name: "Siemens TIA Portal V18".to_string(),
             version: Some("18.0".to_string()),
-            editor: Some("Siemens AG".to_string()),
-            origen: None,
+            publisher: Some("Siemens AG".to_string()),
+            source: None,
         },
-        Programa {
-            nombre: "Microsoft Visual C++ 2015-2022 Redistributable (x64)".to_string(),
+        Program {
+            name: "Microsoft Visual C++ 2015-2022 Redistributable (x64)".to_string(),
             version: Some("14.36.32532".to_string()),
-            editor: Some("Microsoft Corporation".to_string()),
-            origen: None,
+            publisher: Some("Microsoft Corporation".to_string()),
+            source: None,
         },
     ];
 
-    // Todos los paquetes deben conservarse íntegramente
-    assert_eq!(paquetes_muestra.len(), 6);
-    assert!(paquetes_muestra.iter().any(|p| p.nombre.starts_with("lib")));
-    assert!(paquetes_muestra
+    // All packages must be preserved in full.
+    assert_eq!(sample_packages.len(), 6);
+    assert!(sample_packages.iter().any(|p| p.name.starts_with("lib")));
+    assert!(sample_packages
         .iter()
-        .any(|p| p.nombre.starts_with("python3")));
-    assert!(paquetes_muestra
+        .any(|p| p.name.starts_with("python3")));
+    assert!(sample_packages
         .iter()
-        .any(|p| p.nombre.contains("Redistributable")));
-    assert!(paquetes_muestra
-        .iter()
-        .any(|p| p.nombre.contains("Siemens")));
+        .any(|p| p.name.contains("Redistributable")));
+    assert!(sample_packages.iter().any(|p| p.name.contains("Siemens")));
 }
 
 #[test]
-fn test_motor_con_rutas_inexistentes() {
-    let ruta_invalida = std::path::Path::new("ruta_inexistente_12345.vmdk");
-    let opciones = Opciones::default();
-    let motor = MotorInspeccion::new(opciones);
+fn test_engine_with_nonexistent_paths() {
+    let invalid_path = std::path::Path::new("nonexistent_path_12345.vmdk");
+    let options = Options::default();
+    let engine = InspectionEngine::new(options);
 
-    let res = motor.inspeccionar(ruta_invalida);
+    let res = engine.inspect(invalid_path);
     assert!(res.is_err());
     match res {
         Err(VmSpectError::ImageNotFound(p)) => {
-            assert!(p.contains("ruta_inexistente_12345.vmdk"));
+            assert!(p.contains("nonexistent_path_12345.vmdk"));
         }
-        other => panic!("Esperado ImageNotFound, recibido: {:?}", other),
+        other => panic!("Expected ImageNotFound, got: {:?}", other),
     }
 }
 
 #[test]
-fn test_api_descubrimiento_bilingue_e_integridad() {
+fn test_discovery_api_and_integrity() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Crear imágenes de prueba
+    // Create test images
     let qcow2_path = dir.path().join("server.qcow2");
     let mut f1 = std::fs::File::create(&qcow2_path).unwrap();
     use std::io::Write;
@@ -252,45 +250,32 @@ fn test_api_descubrimiento_bilingue_e_integridad() {
         .write_all(b"extent")
         .unwrap();
 
-    // 1. es_imagen_vm / is_vm_image
-    assert!(es_imagen_vm(&qcow2_path));
+    // 1. is_vm_image
     assert!(is_vm_image(&qcow2_path));
-    assert!(es_imagen_vm(&raw_path));
     assert!(is_vm_image(&raw_path));
-    assert!(!es_imagen_vm(&extent_flat));
     assert!(!is_vm_image(&extent_flat));
 
-    // 2. listar_vms / list_vms
-    let lista_es = listar_vms(dir.path(), false).unwrap();
-    let lista_en = list_vms(dir.path(), false).unwrap();
-    assert_eq!(lista_es, lista_en);
-    assert_eq!(lista_es.len(), 2);
-    assert!(lista_es.contains(&qcow2_path));
-    assert!(lista_es.contains(&raw_path));
-    assert!(!lista_es.contains(&extent_flat));
+    // 2. list_vms
+    let list = list_vms(dir.path(), false).unwrap();
+    assert_eq!(list.len(), 2);
+    assert!(list.contains(&qcow2_path));
+    assert!(list.contains(&raw_path));
+    assert!(!list.contains(&extent_flat));
 
-    // 3. contar_vms / count_vms
-    assert_eq!(contar_vms(dir.path(), false).unwrap(), 2);
+    // 3. count_vms
     assert_eq!(count_vms(dir.path(), false).unwrap(), 2);
 
-    // 4. hay_vms / has_vms
-    assert!(hay_vms(dir.path(), false).unwrap());
+    // 4. has_vms
     assert!(has_vms(dir.path(), false).unwrap());
 
-    // 5. verificar_integridad_imagen / verify_image_integrity
-    assert!(verificar_integridad_imagen(&qcow2_path).unwrap());
+    // 5. verify_image_integrity
     assert!(verify_image_integrity(&qcow2_path).unwrap());
-    assert!(verificar_integridad_imagen(&raw_path).unwrap());
     assert!(verify_image_integrity(&raw_path).unwrap());
 
-    // 6. requiere_nbd / requires_nbd / requiere_qemu / requires_qemu
-    assert!(requiere_nbd(&qcow2_path).unwrap());
+    // 6. requires_nbd / requires_qemu
     assert!(requires_nbd(&qcow2_path).unwrap());
-    assert!(requiere_qemu(&qcow2_path).unwrap());
     assert!(requires_qemu(&qcow2_path).unwrap());
 
-    assert!(!requiere_nbd(&raw_path).unwrap());
     assert!(!requires_nbd(&raw_path).unwrap());
-    assert!(!requiere_qemu(&raw_path).unwrap());
     assert!(!requires_qemu(&raw_path).unwrap());
 }

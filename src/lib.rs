@@ -84,10 +84,10 @@ pub use crate::vms::stream::DiscoVirtual;
 pub use engine::{InspectionEngine, MotorInspeccion, ProcesadorConcurrente};
 pub use error::{Result, VmSpectError};
 pub use models::{
-    formatear_bytes, CancellationToken, EsquemaParticion, Estadisticas, Hipervisor, InfoImagen,
-    InformeInspeccion, InspectionProgress, InspectorOS, MemoryMapper, Opciones, OpcionesInspeccion,
-    Particion, Programa, ProgresoInspeccion, ProgresoSnapshot, ResultadoAnalisis, SistemaArchivos,
-    SistemaOperativo, VMInfo, VmDriver,
+    formatear_bytes, CancellationToken, EsquemaParticion, Estadisticas, HerramientasGuest,
+    Hipervisor, InfoImagen, InformeInspeccion, InspectionProgress, InspectorOS, MemoryMapper,
+    Opciones, OpcionesInspeccion, Particion, Programa, ProgresoInspeccion, ProgresoSnapshot,
+    ResultadoAnalisis, SistemaArchivos, SistemaOperativo, VMInfo, VmDriver,
 };
 
 use std::path::Path;

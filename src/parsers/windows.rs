@@ -9,7 +9,7 @@
 
 use crate::error::{Result, VmSpectError};
 use crate::models::traits::{InspectorOS, ResultadoAnalisis, VmDriver};
-use crate::models::{Opciones, Particion, Programa, VMInfo};
+use crate::models::{HerramientasGuest, Opciones, Particion, Programa, VMInfo};
 use crate::vms::stream::DiscoVirtual;
 use nt_hive::{Hive, KeyNode, KeyValue, NtHiveError};
 use ntfs::indexes::NtfsFileNameIndex;
@@ -418,15 +418,15 @@ fn analizar_colmenas(
         vm_info.os_nombre = "Windows (Registro sucio / Inaccesible)".to_string();
     }
 
-    if opciones.debe_analizar_sistema() && vm_info.vmtools_version.is_none() {
+    if opciones.debe_analizar_sistema() && vm_info.guest_tools.is_none() {
         if let Some(system) = &colmenas.system {
             let bytes_system = &system[..];
             let logs_system = colmenas.system_logs_presentes;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                intentar_detectar_vmtools_en_system(bytes_system, logs_system)
+                intentar_detectar_guest_tools_en_system(bytes_system, logs_system)
             })) {
-                Ok(Ok((version, aviso_recuperacion))) => {
-                    vm_info.vmtools_version = version;
+                Ok(Ok((tools, aviso_recuperacion))) => {
+                    vm_info.guest_tools = tools;
                     if let Some(msg) = aviso_recuperacion {
                         tracing::warn!("{}", msg);
                         advertencias.push(msg);
@@ -532,13 +532,13 @@ fn intentar_analizar_software(
     Ok((vm_info, programas, aviso_recuperacion))
 }
 
-/// Intenta parsear la colmena SYSTEM y detectar la versión de VMware Tools a
-/// través del servicio `VMTools`. Devuelve `Err` si la colmena está corrupta o
-/// no puede parsearse (colmena "sucia").
-fn intentar_detectar_vmtools_en_system(
+/// Intenta parsear la colmena SYSTEM y detectar servicios o drivers de herramientas
+/// de integración de hipervisores (VMware Tools, VirtualBox Guest Additions,
+/// QEMU Guest Agent / VirtIO, Hyper-V Integration Services).
+fn intentar_detectar_guest_tools_en_system(
     mmap_system: &[u8],
     logs_transaccionales_presentes: bool,
-) -> Result<(Option<String>, Option<String>)> {
+) -> Result<(Option<HerramientasGuest>, Option<String>)> {
     let (hive_system, aviso_recuperacion) =
         abrir_hive_con_recuperacion(mmap_system, logs_transaccionales_presentes)
             .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
@@ -546,52 +546,162 @@ fn intentar_detectar_vmtools_en_system(
         .root_key_node()
         .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
 
-    let rutas_servicio = [
-        "ControlSet001\\Services\\VMTools",
-        "ControlSet002\\Services\\VMTools",
-        "CurrentControlSet\\Services\\VMTools",
+    let prefijos_control_set = ["ControlSet001", "ControlSet002", "CurrentControlSet"];
+
+    let servicios_con_tipo = [
+        // VMware
+        (
+            "VMware Tools",
+            &[
+                "VMTools",
+                "vmvss",
+                "vmusbmouse",
+                "vmx_svga",
+                "pvscsi",
+                "vmxnet3",
+            ][..],
+        ),
+        // VirtualBox
+        (
+            "VirtualBox Guest Additions",
+            &[
+                "VBoxGuest",
+                "VBoxService",
+                "VBoxMouse",
+                "VBoxSF",
+                "VBoxVideo",
+                "VBoxWddm",
+            ][..],
+        ),
+        // QEMU / KVM / VirtIO
+        (
+            "QEMU Guest Agent",
+            &[
+                "QEMU-GA",
+                "qemu-ga",
+                "viostor",
+                "netkvm",
+                "vioscsi",
+                "vioserial",
+                "viorng",
+                "balloon",
+            ][..],
+        ),
+        // Hyper-V
+        (
+            "Hyper-V Integration Services",
+            &[
+                "vmbus",
+                "hypervkvp",
+                "hv_kvp",
+                "vmicheartbeat",
+                "vmicshutdown",
+                "vmictimesync",
+                "vmicvss",
+                "vmicrdv",
+            ][..],
+        ),
     ];
 
-    for ruta in &rutas_servicio {
-        if let Ok(Some(nodo_servicio)) = buscar_clave_por_ruta(&root_system, ruta) {
-            if let Some(image_path) = leer_valor_de_clave(&nodo_servicio, "ImagePath") {
-                if let Some(ver) = leer_valor_de_clave(&nodo_servicio, "Version") {
+    for prefijo in &prefijos_control_set {
+        for (tipo, servicios) in &servicios_con_tipo {
+            for srv in *servicios {
+                let ruta = format!("{}\\Services\\{}", prefijo, srv);
+                if let Ok(Some(nodo_servicio)) = buscar_clave_por_ruta(&root_system, &ruta) {
+                    let version = leer_valor_de_clave(&nodo_servicio, "Version")
+                        .or_else(|| leer_valor_de_clave(&nodo_servicio, "DriverVersion"));
                     return Ok((
-                        Some(format!("{} (Servicio: {})", ver, image_path)),
+                        Some(HerramientasGuest {
+                            tipo: tipo.to_string(),
+                            version,
+                            presente: true,
+                        }),
                         aviso_recuperacion,
                     ));
                 }
-                return Ok((
-                    Some(format!("Detectado por Servicio ({})", image_path)),
-                    aviso_recuperacion,
-                ));
             }
-            return Ok((
-                Some("Detectado por Servicio Windows (VMTools)".to_string()),
-                aviso_recuperacion,
-            ));
         }
     }
 
     Ok((None, aviso_recuperacion))
 }
 
-fn extraer_version_vmtools(root_node: &HiveKeyNode) -> Option<String> {
-    let rutas_vmtools = [
+fn extraer_guest_tools_software(root_node: &HiveKeyNode) -> Option<HerramientasGuest> {
+    // 1. Claves directas de configuración por hipervisor
+    // VMware Tools
+    let rutas_vmware = [
         "VMware, Inc.\\VMware Tools",
         "WOW6432Node\\VMware, Inc.\\VMware Tools",
     ];
-
-    for ruta in &rutas_vmtools {
-        if let Ok(Some(nodo_vmtools)) = buscar_clave_por_ruta(root_node, ruta) {
-            if let Some(ver) = leer_valor_de_clave(&nodo_vmtools, "InstallVersion")
-                .or_else(|| leer_valor_de_clave(&nodo_vmtools, "Version"))
-            {
-                return Some(ver);
-            }
+    for ruta in &rutas_vmware {
+        if let Ok(Some(nodo)) = buscar_clave_por_ruta(root_node, ruta) {
+            let ver = leer_valor_de_clave(&nodo, "InstallVersion")
+                .or_else(|| leer_valor_de_clave(&nodo, "Version"));
+            return Some(HerramientasGuest {
+                tipo: "VMware Tools".to_string(),
+                version: ver,
+                presente: true,
+            });
         }
     }
 
+    // VirtualBox Guest Additions
+    let rutas_vbox = [
+        "Oracle\\VirtualBox Guest Additions",
+        "WOW6432Node\\Oracle\\VirtualBox Guest Additions",
+    ];
+    for ruta in &rutas_vbox {
+        if let Ok(Some(nodo)) = buscar_clave_por_ruta(root_node, ruta) {
+            let ver = leer_valor_de_clave(&nodo, "Version");
+            return Some(HerramientasGuest {
+                tipo: "VirtualBox Guest Additions".to_string(),
+                version: ver,
+                presente: true,
+            });
+        }
+    }
+
+    // QEMU Guest Agent & VirtIO
+    let rutas_qemu = [
+        "QEMU Guest Agent",
+        "WOW6432Node\\QEMU Guest Agent",
+        "Red Hat\\VirtIO",
+        "WOW6432Node\\Red Hat\\VirtIO",
+        "Red Hat\\Virtio",
+        "WOW6432Node\\Red Hat\\Virtio",
+    ];
+    for ruta in &rutas_qemu {
+        if let Ok(Some(nodo)) = buscar_clave_por_ruta(root_node, ruta) {
+            let ver = leer_valor_de_clave(&nodo, "Version")
+                .or_else(|| leer_valor_de_clave(&nodo, "DisplayVersion"))
+                .or_else(|| leer_valor_de_clave(&nodo, "InstallVersion"));
+            return Some(HerramientasGuest {
+                tipo: "QEMU Guest Agent".to_string(),
+                version: ver,
+                presente: true,
+            });
+        }
+    }
+
+    // Hyper-V Integration Services
+    let rutas_hyperv = [
+        "Microsoft\\Virtual Machine\\Auto",
+        "WOW6432Node\\Microsoft\\Virtual Machine\\Auto",
+        "Microsoft\\Virtual Machine\\Guest\\Parameters",
+    ];
+    for ruta in &rutas_hyperv {
+        if let Ok(Some(nodo)) = buscar_clave_por_ruta(root_node, ruta) {
+            let ver = leer_valor_de_clave(&nodo, "IntegrationServicesVersion")
+                .or_else(|| leer_valor_de_clave(&nodo, "Version"));
+            return Some(HerramientasGuest {
+                tipo: "Hyper-V Integration Services".to_string(),
+                version: ver,
+                presente: true,
+            });
+        }
+    }
+
+    // 2. Búsqueda en claves de instalador MSI / Products
     let rutas_installer =
         ["Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products"];
 
@@ -602,12 +712,13 @@ fn extraer_version_vmtools(root_node: &HiveKeyNode) -> Option<String> {
                     if let Ok(Some(install_properties)) =
                         buscar_clave_por_ruta(&subkey, "InstallProperties")
                     {
-                        if es_clave_vmware_tools(&install_properties) {
-                            if let Some(ver) =
-                                leer_valor_de_clave(&install_properties, "DisplayVersion")
-                            {
-                                return Some(ver);
-                            }
+                        if let Some((tipo, ver)) = clasificar_clave_guest_tools(&install_properties)
+                        {
+                            return Some(HerramientasGuest {
+                                tipo,
+                                version: ver,
+                                presente: true,
+                            });
                         }
                     }
                 }
@@ -615,6 +726,7 @@ fn extraer_version_vmtools(root_node: &HiveKeyNode) -> Option<String> {
         }
     }
 
+    // 3. Búsqueda en claves Uninstall
     let rutas_uninstall = [
         "Microsoft\\Windows\\CurrentVersion\\Uninstall",
         "WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
@@ -624,10 +736,12 @@ fn extraer_version_vmtools(root_node: &HiveKeyNode) -> Option<String> {
         if let Ok(Some(uninstall_node)) = buscar_clave_por_ruta(root_node, rel_path) {
             if let Some(Ok(subclaves)) = uninstall_node.subkeys() {
                 for subkey in subclaves.flatten() {
-                    if es_clave_vmware_tools(&subkey) {
-                        if let Some(ver) = leer_valor_de_clave(&subkey, "DisplayVersion") {
-                            return Some(ver);
-                        }
+                    if let Some((tipo, ver)) = clasificar_clave_guest_tools(&subkey) {
+                        return Some(HerramientasGuest {
+                            tipo,
+                            version: ver,
+                            presente: true,
+                        });
                     }
                 }
             }
@@ -637,11 +751,32 @@ fn extraer_version_vmtools(root_node: &HiveKeyNode) -> Option<String> {
     None
 }
 
-fn es_clave_vmware_tools(key: &HiveKeyNode) -> bool {
+fn clasificar_clave_guest_tools(key: &HiveKeyNode) -> Option<(String, Option<String>)> {
     if let Some(nombre) = leer_valor_de_clave(key, "DisplayName") {
-        return nombre.to_lowercase().contains("vmware tools");
+        let nombre_min = nombre.to_lowercase();
+        let ver = leer_valor_de_clave(key, "DisplayVersion");
+
+        if nombre_min.contains("vmware tools") {
+            return Some(("VMware Tools".to_string(), ver));
+        }
+        if nombre_min.contains("virtualbox guest additions")
+            || nombre_min.contains("oracle vm virtualbox guest additions")
+        {
+            return Some(("VirtualBox Guest Additions".to_string(), ver));
+        }
+        if nombre_min.contains("qemu guest agent")
+            || nombre_min.contains("virtio")
+            || nombre_min.contains("red hat virtio")
+        {
+            return Some(("QEMU Guest Agent".to_string(), ver));
+        }
+        if nombre_min.contains("hyper-v integration services")
+            || nombre_min.contains("hyper-v guest components")
+        {
+            return Some(("Hyper-V Integration Services".to_string(), ver));
+        }
     }
-    false
+    None
 }
 
 fn leer_valor_de_clave(key: &HiveKeyNode, nombre_campo: &str) -> Option<String> {
@@ -702,7 +837,7 @@ fn extraer_informacion_vm(root_node: &HiveKeyNode) -> VMInfo {
         info.os_nombre = "Windows (Edición desconocida)".to_string();
     }
 
-    info.vmtools_version = extraer_version_vmtools(root_node);
+    info.guest_tools = extraer_guest_tools_software(root_node);
 
     info
 }
@@ -1063,14 +1198,42 @@ mod tests {
     use crate::models::SistemaArchivos;
 
     #[test]
-    fn test_es_clave_vmware_tools() {
-        let p = Programa {
-            nombre: "VMware Tools".to_string(),
-            version: Some("12.4.5".to_string()),
-            editor: Some("VMware, Inc.".to_string()),
-            origen: None,
-        };
-        assert!(p.nombre.to_lowercase().contains("vmware tools"));
+    fn test_clasificacion_guest_tools_strings() {
+        let tests = [
+            ("VMware Tools", "VMware Tools"),
+            (
+                "Oracle VM VirtualBox Guest Additions 7.0.12",
+                "VirtualBox Guest Additions",
+            ),
+            ("QEMU Guest Agent", "QEMU Guest Agent"),
+            ("Red Hat VirtIO Ethernet Adapter", "QEMU Guest Agent"),
+            (
+                "Hyper-V Integration Services",
+                "Hyper-V Integration Services",
+            ),
+        ];
+
+        for (nombre, tipo_esperado) in tests {
+            let nombre_min = nombre.to_lowercase();
+            let mut detectado = None;
+            if nombre_min.contains("vmware tools") {
+                detectado = Some("VMware Tools");
+            } else if nombre_min.contains("virtualbox guest additions")
+                || nombre_min.contains("oracle vm virtualbox guest additions")
+            {
+                detectado = Some("VirtualBox Guest Additions");
+            } else if nombre_min.contains("qemu guest agent")
+                || nombre_min.contains("virtio")
+                || nombre_min.contains("red hat virtio")
+            {
+                detectado = Some("QEMU Guest Agent");
+            } else if nombre_min.contains("hyper-v integration services")
+                || nombre_min.contains("hyper-v guest components")
+            {
+                detectado = Some("Hyper-V Integration Services");
+            }
+            assert_eq!(detectado, Some(tipo_esperado));
+        }
     }
 
     /// Verifica el algoritmo de conversion de dias-desde-epoca a fecha civil

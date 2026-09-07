@@ -10,7 +10,7 @@ pub use crate::models::options::{
 pub use crate::models::partition::{
     EsquemaParticion, Particion, SistemaArchivos, SistemaOperativo,
 };
-pub use crate::models::software::{Programa, VMInfo};
+pub use crate::models::software::{HerramientasGuest, Programa, VMInfo};
 pub use crate::models::traits::{InspectorOS, MemoryMapper, ResultadoAnalisis, VmDriver};
 pub use crate::vms::discovery::{
     contar_vms, count_vms, es_extent_secundario, es_imagen_vm, has_vms, hay_vms,

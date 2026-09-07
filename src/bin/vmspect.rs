@@ -454,8 +454,14 @@ fn imprimir_informe_humano(informe: &InformeInspeccion, duracion_ms: u64) {
     } else {
         println!("    Nombre / Versión: No detectado o no disponible");
     }
-    if let Some(ref tools) = info.vmtools_version {
-        println!("    VM Guest Tools:  {}", tools);
+    if let Some(ref tools) = info.guest_tools {
+        if tools.presente {
+            if let Some(ref ver) = tools.version {
+                println!("    Guest Tools:     {} {}", tools.tipo, ver);
+            } else {
+                println!("    Guest Tools:     {}", tools.tipo);
+            }
+        }
     }
 
     if !informe.advertencias.is_empty() {

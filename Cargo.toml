@@ -18,6 +18,7 @@ ext4 = "0.9"
 ntfs = "0.4"
 nt-hive = "0.3"
 positioned-io = "0.2"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3.10"

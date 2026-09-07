@@ -506,16 +506,33 @@ impl MotorInspeccion {
             });
         }
 
+        // Graceful Degradation: un fallo durante el análisis del sistema operativo
+        // invitado (ej. Registro de Windows sucio/corrupto) NO debe abortar el
+        // pipeline completo. Se registra como advertencia y se continua con los
+        // datos de imagen, particiones y sistemas de archivos ya recopilados.
         let resultado = if opciones_efectivas.debe_analizar_sistema()
             || opciones_efectivas.debe_analizar_apps()
         {
             let inspector = parsers::obtener_inspector(&disco.sistema_operativo);
-            inspector.analizar(
+            match inspector.analizar(
                 &lector,
                 &disco.particiones,
                 tamano_chunk,
                 &opciones_efectivas,
-            )?
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!(
+                        "No se pudo completar el análisis del sistema operativo invitado, se continúa solo con los datos de imagen/particiones: {}",
+                        e
+                    );
+                    tracing::warn!("{}", msg);
+                    ResultadoAnalisis {
+                        advertencias: vec![msg],
+                        ..ResultadoAnalisis::default()
+                    }
+                }
+            }
         } else {
             ResultadoAnalisis::default()
         };
@@ -548,6 +565,7 @@ impl MotorInspeccion {
             sistema_operativo: disco.sistema_operativo,
             vm_info: resultado.vm_info,
             programas: resultado.programas,
+            advertencias: resultado.advertencias,
             estadisticas,
         };
 

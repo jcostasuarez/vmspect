@@ -1,11 +1,10 @@
-//! Análisis de invitados Linux utilizando la crate ext4.
+//! Linux guest analysis using the `ext4` crate.
 //!
-//! Realiza la lectura del sistema de archivos en espacio de usuario sin montar
-//! la partición en el sistema operativo anfitrión.
+//! Reads the file system in user space without mounting the partition on the host operating system.
 use crate::error::Result;
-use crate::models::traits::{InspectorOS, ResultadoAnalisis, VmDriver};
-use crate::models::{HerramientasGuest, Opciones, Particion, Programa, SistemaArchivos, VMInfo};
-use crate::vms::stream::DiscoVirtual;
+use crate::models::traits::{AnalysisResult, OsInspector, VmDriver};
+use crate::models::{FileSystem, GuestInfo, GuestTools, Options, Partition, Program};
+use crate::vms::stream::VirtualDisk;
 use ext4::SuperBlock;
 use positioned_io::ReadAt;
 
@@ -13,114 +12,110 @@ use std::io::Read;
 
 pub(crate) struct LinuxInspector;
 
-impl InspectorOS for LinuxInspector {
-    fn analizar(
+impl OsInspector for LinuxInspector {
+    fn analyze(
         &self,
         driver: &dyn VmDriver,
-        particiones: &[Particion],
-        tamano_chunk: u64,
-        opciones: &Opciones,
-    ) -> Result<ResultadoAnalisis> {
-        if !opciones.debe_analizar_sistema() && !opciones.debe_analizar_apps() {
-            return Ok(ResultadoAnalisis::default());
+        partitions: &[Partition],
+        chunk_size: u64,
+        options: &Options,
+    ) -> Result<AnalysisResult> {
+        if !options.should_analyze_system() && !options.should_analyze_apps() {
+            return Ok(AnalysisResult::default());
         }
 
-        let mut candidatas: Vec<_> = particiones
+        let mut candidates: Vec<_> = partitions
             .iter()
             .filter(|p| {
                 matches!(
-                    p.sistema_archivos,
-                    SistemaArchivos::Ext4 | SistemaArchivos::Ext3 | SistemaArchivos::Ext2
+                    p.file_system,
+                    FileSystem::Ext4 | FileSystem::Ext3 | FileSystem::Ext2
                 )
             })
             .collect();
 
-        candidatas.sort_by_key(|p| std::cmp::Reverse(p.tamano));
+        candidates.sort_by_key(|p| std::cmp::Reverse(p.size));
 
-        for particion in candidatas {
-            let mut disco =
-                DiscoVirtual::new(driver, particion.inicio, particion.tamano, tamano_chunk);
+        for partition in candidates {
+            let mut disk = VirtualDisk::new(driver, partition.start, partition.size, chunk_size);
 
-            if let Ok(sb) = SuperBlock::new(&mut disco) {
-                if let Ok(resultado) = analizar_sistema_archivos(&sb, opciones) {
-                    return Ok(resultado);
+            if let Ok(sb) = SuperBlock::new(&mut disk) {
+                if let Ok(result) = analyze_file_system(&sb, options) {
+                    return Ok(result);
                 }
             }
         }
 
         // Fallback
-        Ok(ResultadoAnalisis {
-            vm_info: if opciones.debe_analizar_sistema() {
-                VMInfo {
-                    os_nombre: "Linux (No se pudo leer rootfs)".to_string(),
-                    ..VMInfo::default()
+        Ok(AnalysisResult {
+            guest_info: if options.should_analyze_system() {
+                GuestInfo {
+                    os_name: "Linux (rootfs could not be read)".to_string(),
+                    ..GuestInfo::default()
                 }
             } else {
-                VMInfo::default()
+                GuestInfo::default()
             },
-            programas: Vec::new(),
-            advertencias: Vec::new(),
+            programs: Vec::new(),
+            warnings: Vec::new(),
         })
     }
 }
 
-fn analizar_sistema_archivos<R: ReadAt>(
-    sb: &SuperBlock<R>,
-    opciones: &Opciones,
-) -> Result<ResultadoAnalisis> {
-    let mut vm_info = VMInfo::default();
-    let mut programas = Vec::new();
+fn analyze_file_system<R: ReadAt>(sb: &SuperBlock<R>, options: &Options) -> Result<AnalysisResult> {
+    let mut guest_info = GuestInfo::default();
+    let mut programs = Vec::new();
 
-    if opciones.debe_analizar_sistema() {
-        if let Ok(contenido) = leer_archivo_texto(sb, "/etc/os-release")
-            .or_else(|_| leer_archivo_texto(sb, "/usr/lib/os-release"))
+    if options.should_analyze_system() {
+        if let Ok(content) = read_text_file(sb, "/etc/os-release")
+            .or_else(|_| read_text_file(sb, "/usr/lib/os-release"))
         {
-            parsear_os_release(&contenido, &mut vm_info);
+            parse_os_release(&content, &mut guest_info);
         }
 
-        if let Ok(hostname) = leer_archivo_texto(sb, "/etc/hostname") {
+        if let Ok(hostname) = read_text_file(sb, "/etc/hostname") {
             let name = hostname.trim();
             if !name.is_empty() {
-                vm_info.os_edition_version = format!("Host: {}", name);
+                guest_info.os_edition = format!("Host: {}", name);
             }
         }
     }
 
-    if let Ok(dpkg_status) = leer_archivo_texto(sb, "/var/lib/dpkg/status") {
-        let (pkgs, guest_tools) = parsear_dpkg_status(&dpkg_status, opciones);
-        if opciones.debe_analizar_apps() {
-            programas.extend(pkgs);
+    if let Ok(dpkg_status) = read_text_file(sb, "/var/lib/dpkg/status") {
+        let (pkgs, guest_tools) = parse_dpkg_status(&dpkg_status, options);
+        if options.should_analyze_apps() {
+            programs.extend(pkgs);
         }
-        if opciones.debe_analizar_sistema() {
+        if options.should_analyze_system() {
             if let Some(tools) = guest_tools {
-                vm_info.guest_tools = Some(tools);
+                guest_info.guest_tools = Some(tools);
             }
         }
     }
 
-    if opciones.debe_analizar_sistema() && vm_info.guest_tools.is_none() {
-        vm_info.guest_tools = detectar_guest_tools_archivos_linux(sb);
+    if options.should_analyze_system() && guest_info.guest_tools.is_none() {
+        guest_info.guest_tools = detect_guest_tools_linux_files(sb);
     }
 
-    if opciones.debe_analizar_apps() {
-        // Ordenar y deduplicar respetando la estructura Programa
-        programas.sort_by(|a, b| a.nombre.cmp(&b.nombre));
-        programas.dedup_by(|a, b| a.nombre == b.nombre && a.version == b.version);
+    if options.should_analyze_apps() {
+        // Sort and deduplicate respecting the Program structure
+        programs.sort_by(|a, b| a.name.cmp(&b.name));
+        programs.dedup_by(|a, b| a.name == b.name && a.version == b.version);
     }
 
-    Ok(ResultadoAnalisis {
-        vm_info,
-        programas,
-        advertencias: Vec::new(),
+    Ok(AnalysisResult {
+        guest_info,
+        programs,
+        warnings: Vec::new(),
     })
 }
 
-/// Inspecciona binarios o unidades de servicio del sistema operativo invitado Linux
-/// para detectar suites de herramientas de integración (VMware Tools, VirtualBox Guest Additions,
-/// QEMU Guest Agent y Hyper-V Integration Services) cuando no provienen del gestor de paquetes.
-fn detectar_guest_tools_archivos_linux<R: ReadAt>(sb: &SuperBlock<R>) -> Option<HerramientasGuest> {
+/// Inspects binaries or service units of the Linux guest OS to detect integration tool
+/// suites (VMware Tools, VirtualBox Guest Additions, QEMU Guest Agent and Hyper-V
+/// Integration Services) when they are not provided by the package manager.
+fn detect_guest_tools_linux_files<R: ReadAt>(sb: &SuperBlock<R>) -> Option<GuestTools> {
     // 1. VMware
-    let rutas_vmware = [
+    let vmware_paths = [
         "/usr/bin/vmtoolsd",
         "/usr/sbin/vmtoolsd",
         "/bin/vmtoolsd",
@@ -129,18 +124,18 @@ fn detectar_guest_tools_archivos_linux<R: ReadAt>(sb: &SuperBlock<R>) -> Option<
         "/lib/systemd/system/open-vm-tools.service",
         "/etc/systemd/system/open-vm-tools.service",
     ];
-    for ruta in &rutas_vmware {
-        if sb.resolve_path(ruta).is_ok() {
-            return Some(HerramientasGuest {
-                tipo: "VMware Tools".to_string(),
+    for path in &vmware_paths {
+        if sb.resolve_path(path).is_ok() {
+            return Some(GuestTools {
+                kind: "VMware Tools".to_string(),
                 version: None,
-                presente: true,
+                present: true,
             });
         }
     }
 
     // 2. VirtualBox
-    let rutas_vbox = [
+    let vbox_paths = [
         "/usr/sbin/VBoxService",
         "/usr/bin/VBoxService",
         "/usr/sbin/vboxservice",
@@ -150,35 +145,35 @@ fn detectar_guest_tools_archivos_linux<R: ReadAt>(sb: &SuperBlock<R>) -> Option<
         "/etc/systemd/system/vboxadd-service.service",
         "/opt/VBoxGuestAdditions",
     ];
-    for ruta in &rutas_vbox {
-        if sb.resolve_path(ruta).is_ok() {
-            return Some(HerramientasGuest {
-                tipo: "VirtualBox Guest Additions".to_string(),
+    for path in &vbox_paths {
+        if sb.resolve_path(path).is_ok() {
+            return Some(GuestTools {
+                kind: "VirtualBox Guest Additions".to_string(),
                 version: None,
-                presente: true,
+                present: true,
             });
         }
     }
 
     // 3. QEMU Guest Agent
-    let rutas_qemu = [
+    let qemu_paths = [
         "/usr/bin/qemu-ga",
         "/usr/sbin/qemu-ga",
         "/lib/systemd/system/qemu-guest-agent.service",
         "/etc/systemd/system/qemu-guest-agent.service",
     ];
-    for ruta in &rutas_qemu {
-        if sb.resolve_path(ruta).is_ok() {
-            return Some(HerramientasGuest {
-                tipo: "QEMU Guest Agent".to_string(),
+    for path in &qemu_paths {
+        if sb.resolve_path(path).is_ok() {
+            return Some(GuestTools {
+                kind: "QEMU Guest Agent".to_string(),
                 version: None,
-                presente: true,
+                present: true,
             });
         }
     }
 
     // 4. Hyper-V
-    let rutas_hyperv = [
+    let hyperv_paths = [
         "/usr/sbin/hv_kvp_daemon",
         "/usr/bin/hv_kvp_daemon",
         "/usr/sbin/hv_vss_daemon",
@@ -186,12 +181,12 @@ fn detectar_guest_tools_archivos_linux<R: ReadAt>(sb: &SuperBlock<R>) -> Option<
         "/lib/systemd/system/hv-kvp-daemon.service",
         "/lib/systemd/system/hypervkvp.service",
     ];
-    for ruta in &rutas_hyperv {
-        if sb.resolve_path(ruta).is_ok() {
-            return Some(HerramientasGuest {
-                tipo: "Hyper-V Integration Services".to_string(),
+    for path in &hyperv_paths {
+        if sb.resolve_path(path).is_ok() {
+            return Some(GuestTools {
+                kind: "Hyper-V Integration Services".to_string(),
                 version: None,
-                presente: true,
+                present: true,
             });
         }
     }
@@ -199,28 +194,25 @@ fn detectar_guest_tools_archivos_linux<R: ReadAt>(sb: &SuperBlock<R>) -> Option<
     None
 }
 
-fn parsear_dpkg_status(
-    contenido: &str,
-    opciones: &Opciones,
-) -> (Vec<Programa>, Option<HerramientasGuest>) {
-    let mut paquetes = Vec::new();
-    let mut guest_tools: Option<HerramientasGuest> = None;
+fn parse_dpkg_status(content: &str, options: &Options) -> (Vec<Program>, Option<GuestTools>) {
+    let mut packages = Vec::new();
+    let mut guest_tools: Option<GuestTools> = None;
 
-    let mut pkg_actual = String::new();
-    let mut ver_actual = String::new();
-    let mut seccion_actual = String::new();
-    let mut instalado = false;
+    let mut current_pkg = String::new();
+    let mut current_ver = String::new();
+    let mut current_section = String::new();
+    let mut installed = false;
 
-    let debe_apps = opciones.debe_analizar_apps();
+    let should_apps = options.should_analyze_apps();
 
-    let procesar_paquete = |pkg: &str,
-                            ver: &str,
-                            sec: &str,
-                            inst: bool,
-                            pkgs: &mut Vec<Programa>,
-                            tools: &mut Option<HerramientasGuest>| {
+    let process_package = |pkg: &str,
+                           ver: &str,
+                           sec: &str,
+                           inst: bool,
+                           pkgs: &mut Vec<Program>,
+                           tools: &mut Option<GuestTools>| {
         if inst && !pkg.is_empty() {
-            // Capturar herramientas de integración agnósticas del hipervisor
+            // Capture hypervisor-agnostic integration tools
             if tools.is_none() {
                 let ver_opt = if !ver.is_empty() {
                     Some(ver.to_string())
@@ -229,110 +221,110 @@ fn parsear_dpkg_status(
                 };
 
                 if pkg == "open-vm-tools" || pkg == "open-vm-tools-desktop" {
-                    *tools = Some(HerramientasGuest {
-                        tipo: "VMware Tools".to_string(),
+                    *tools = Some(GuestTools {
+                        kind: "VMware Tools".to_string(),
                         version: ver_opt,
-                        presente: true,
+                        present: true,
                     });
                 } else if pkg == "virtualbox-guest-utils"
                     || pkg == "virtualbox-guest-x11"
                     || pkg == "virtualbox-guest-dkms"
                     || pkg == "virtualbox-guest-additions-iso"
                 {
-                    *tools = Some(HerramientasGuest {
-                        tipo: "VirtualBox Guest Additions".to_string(),
+                    *tools = Some(GuestTools {
+                        kind: "VirtualBox Guest Additions".to_string(),
                         version: ver_opt,
-                        presente: true,
+                        present: true,
                     });
                 } else if pkg == "qemu-guest-agent" {
-                    *tools = Some(HerramientasGuest {
-                        tipo: "QEMU Guest Agent".to_string(),
+                    *tools = Some(GuestTools {
+                        kind: "QEMU Guest Agent".to_string(),
                         version: ver_opt,
-                        presente: true,
+                        present: true,
                     });
                 } else if pkg == "hyperv-daemons"
                     || pkg == "hv-kvp-daemon-init"
                     || pkg == "linux-cloud-tools-virtual"
                 {
-                    *tools = Some(HerramientasGuest {
-                        tipo: "Hyper-V Integration Services".to_string(),
+                    *tools = Some(GuestTools {
+                        kind: "Hyper-V Integration Services".to_string(),
                         version: ver_opt,
-                        presente: true,
+                        present: true,
                     });
                 }
             }
 
-            if debe_apps {
+            if should_apps {
                 let version_opt = if !ver.is_empty() {
                     Some(ver.to_string())
                 } else {
                     None
                 };
 
-                let editor_opt = if !sec.is_empty() {
+                let publisher_opt = if !sec.is_empty() {
                     Some(sec.to_string())
                 } else {
                     None
                 };
 
-                pkgs.push(Programa {
-                    nombre: pkg.to_string(),
+                pkgs.push(Program {
+                    name: pkg.to_string(),
                     version: version_opt,
-                    editor: editor_opt,
-                    origen: None,
+                    publisher: publisher_opt,
+                    source: None,
                 });
             }
         }
     };
 
-    for linea in contenido.lines() {
-        if let Some(cancel) = &opciones.cancel_token {
+    for line in content.lines() {
+        if let Some(cancel) = &options.cancel_token {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
         }
 
-        if linea.starts_with("Package: ") {
-            pkg_actual = linea.trim_start_matches("Package: ").trim().to_string();
-        } else if linea.starts_with("Status: ") {
-            instalado = linea.contains("install ok installed");
-        } else if linea.starts_with("Version: ") {
-            ver_actual = linea.trim_start_matches("Version: ").trim().to_string();
-        } else if linea.starts_with("Section: ") {
-            seccion_actual = linea.trim_start_matches("Section: ").trim().to_string();
-        } else if linea.trim().is_empty() {
-            procesar_paquete(
-                &pkg_actual,
-                &ver_actual,
-                &seccion_actual,
-                instalado,
-                &mut paquetes,
+        if line.starts_with("Package: ") {
+            current_pkg = line.trim_start_matches("Package: ").trim().to_string();
+        } else if line.starts_with("Status: ") {
+            installed = line.contains("install ok installed");
+        } else if line.starts_with("Version: ") {
+            current_ver = line.trim_start_matches("Version: ").trim().to_string();
+        } else if line.starts_with("Section: ") {
+            current_section = line.trim_start_matches("Section: ").trim().to_string();
+        } else if line.trim().is_empty() {
+            process_package(
+                &current_pkg,
+                &current_ver,
+                &current_section,
+                installed,
+                &mut packages,
                 &mut guest_tools,
             );
-            pkg_actual.clear();
-            ver_actual.clear();
-            seccion_actual.clear();
-            instalado = false;
+            current_pkg.clear();
+            current_ver.clear();
+            current_section.clear();
+            installed = false;
         }
     }
 
-    // Procesar último paquete si no había línea vacía al final
-    procesar_paquete(
-        &pkg_actual,
-        &ver_actual,
-        &seccion_actual,
-        instalado,
-        &mut paquetes,
+    // Process the last package if there was no blank line at the end.
+    process_package(
+        &current_pkg,
+        &current_ver,
+        &current_section,
+        installed,
+        &mut packages,
         &mut guest_tools,
     );
 
-    (paquetes, guest_tools)
+    (packages, guest_tools)
 }
 
-/// Lee un archivo de texto de la partición ext4 y lo devuelve como String.
-fn leer_archivo_texto<R: ReadAt>(sb: &SuperBlock<R>, ruta: &str) -> Result<String> {
+/// Reads a text file from the ext4 partition and returns it as a String.
+fn read_text_file<R: ReadAt>(sb: &SuperBlock<R>, path: &str) -> Result<String> {
     let entry = sb
-        .resolve_path(ruta)
+        .resolve_path(path)
         .map_err(|e| crate::error::VmSpectError::FileSystem(format!("{:?}", e)))?;
     let inode = sb
         .load_inode(entry.inode)
@@ -345,27 +337,27 @@ fn leer_archivo_texto<R: ReadAt>(sb: &SuperBlock<R>, ruta: &str) -> Result<Strin
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
-/// Parsea `/etc/os-release` extrayendo el nombre y versión del SO.
-fn parsear_os_release(contenido: &str, info: &mut VMInfo) {
-    for linea in contenido.lines() {
-        let linea = linea.trim();
-        if linea.starts_with('#') || !linea.contains('=') {
+/// Parses `/etc/os-release`, extracting the OS name and version.
+fn parse_os_release(content: &str, info: &mut GuestInfo) {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.contains('=') {
             continue;
         }
 
-        let mut partes = linea.splitn(2, '=');
-        let clave = partes.next().unwrap_or("").trim();
-        let valor = partes
+        let mut parts = line.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts
             .next()
             .unwrap_or("")
             .trim()
             .trim_matches('"')
             .trim_matches('\'');
 
-        match clave {
-            "PRETTY_NAME" => info.os_nombre = valor.to_string(),
-            "VERSION_ID" if info.os_build.is_empty() => info.os_build = valor.to_string(),
-            "NAME" if info.os_nombre.is_empty() => info.os_nombre = valor.to_string(),
+        match key {
+            "PRETTY_NAME" => info.os_name = value.to_string(),
+            "VERSION_ID" if info.os_build.is_empty() => info.os_build = value.to_string(),
+            "NAME" if info.os_name.is_empty() => info.os_name = value.to_string(),
             _ => {}
         }
     }
@@ -376,7 +368,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parsear_os_release() {
+    fn test_parse_os_release() {
         let os_release = r#"
 NAME="Ubuntu"
 VERSION="22.04.3 LTS (Jammy Jellyfish)"
@@ -385,14 +377,14 @@ ID_LIKE=debian
 PRETTY_NAME="Ubuntu 22.04.3 LTS"
 VERSION_ID="22.04"
 "#;
-        let mut info = VMInfo::default();
-        parsear_os_release(os_release, &mut info);
-        assert_eq!(info.os_nombre, "Ubuntu 22.04.3 LTS");
+        let mut info = GuestInfo::default();
+        parse_os_release(os_release, &mut info);
+        assert_eq!(info.os_name, "Ubuntu 22.04.3 LTS");
         assert_eq!(info.os_build, "22.04");
     }
 
     #[test]
-    fn test_parsear_dpkg_status_agnostico() {
+    fn test_parse_dpkg_status_agnostic() {
         let dpkg = r#"
 Package: open-vm-tools
 Status: install ok installed
@@ -421,26 +413,26 @@ Priority: optional
 Section: python
 Version: 3.10.6-1~22.04
 "#;
-        let opciones = Opciones::default();
-        let (paquetes, tools) = parsear_dpkg_status(dpkg, &opciones);
+        let options = Options::default();
+        let (packages, tools) = parse_dpkg_status(dpkg, &options);
         assert_eq!(
             tools,
-            Some(HerramientasGuest {
-                tipo: "VMware Tools".to_string(),
+            Some(GuestTools {
+                kind: "VMware Tools".to_string(),
                 version: Some("2:12.1.5-1ubuntu0.22.04.4".to_string()),
-                presente: true,
+                present: true,
             })
         );
-        // Debe incluir TODOS los paquetes sin filtrar por librerías, prefijos o sufijos
-        assert_eq!(paquetes.len(), 4);
-        assert!(paquetes.iter().any(|p| p.nombre == "open-vm-tools"));
-        assert!(paquetes.iter().any(|p| p.nombre == "mosquitto"));
-        assert!(paquetes.iter().any(|p| p.nombre == "libc6"));
-        assert!(paquetes.iter().any(|p| p.nombre == "python3-minimal"));
+        // Must include ALL packages without filtering by libraries, prefixes or suffixes
+        assert_eq!(packages.len(), 4);
+        assert!(packages.iter().any(|p| p.name == "open-vm-tools"));
+        assert!(packages.iter().any(|p| p.name == "mosquitto"));
+        assert!(packages.iter().any(|p| p.name == "libc6"));
+        assert!(packages.iter().any(|p| p.name == "python3-minimal"));
     }
 
     #[test]
-    fn test_parsear_dpkg_status_noapps() {
+    fn test_parse_dpkg_status_no_apps() {
         let dpkg = r#"
 Package: open-vm-tools
 Status: install ok installed
@@ -454,24 +446,24 @@ Priority: optional
 Section: net
 Version: 2.0.11-1ubuntu1.1
 "#;
-        let opciones = Opciones {
-            noapps: true,
-            ..Opciones::default()
+        let options = Options {
+            no_apps: true,
+            ..Options::default()
         };
-        let (paquetes, tools) = parsear_dpkg_status(dpkg, &opciones);
+        let (packages, tools) = parse_dpkg_status(dpkg, &options);
         assert_eq!(
             tools,
-            Some(HerramientasGuest {
-                tipo: "VMware Tools".to_string(),
+            Some(GuestTools {
+                kind: "VMware Tools".to_string(),
                 version: Some("2:12.1.5-1ubuntu0.22.04.4".to_string()),
-                presente: true,
+                present: true,
             })
         );
-        assert!(paquetes.is_empty());
+        assert!(packages.is_empty());
     }
 
     #[test]
-    fn test_parsear_dpkg_status_hipervisores_multiples() {
+    fn test_parse_dpkg_status_multiple_hypervisors() {
         let dpkg_vbox = r#"
 Package: virtualbox-guest-utils
 Status: install ok installed
@@ -479,13 +471,13 @@ Priority: optional
 Section: admin
 Version: 7.0.12-dfsg-1
 "#;
-        let (_, tools_vbox) = parsear_dpkg_status(dpkg_vbox, &Opciones::default());
+        let (_, tools_vbox) = parse_dpkg_status(dpkg_vbox, &Options::default());
         assert_eq!(
             tools_vbox,
-            Some(HerramientasGuest {
-                tipo: "VirtualBox Guest Additions".to_string(),
+            Some(GuestTools {
+                kind: "VirtualBox Guest Additions".to_string(),
                 version: Some("7.0.12-dfsg-1".to_string()),
-                presente: true,
+                present: true,
             })
         );
 
@@ -496,13 +488,13 @@ Priority: optional
 Section: admin
 Version: 1:8.2.2+ds-0ubuntu1
 "#;
-        let (_, tools_qemu) = parsear_dpkg_status(dpkg_qemu, &Opciones::default());
+        let (_, tools_qemu) = parse_dpkg_status(dpkg_qemu, &Options::default());
         assert_eq!(
             tools_qemu,
-            Some(HerramientasGuest {
-                tipo: "QEMU Guest Agent".to_string(),
+            Some(GuestTools {
+                kind: "QEMU Guest Agent".to_string(),
                 version: Some("1:8.2.2+ds-0ubuntu1".to_string()),
-                presente: true,
+                present: true,
             })
         );
 
@@ -513,13 +505,13 @@ Priority: optional
 Section: admin
 Version: 5.15.0-91.101
 "#;
-        let (_, tools_hyperv) = parsear_dpkg_status(dpkg_hyperv, &Opciones::default());
+        let (_, tools_hyperv) = parse_dpkg_status(dpkg_hyperv, &Options::default());
         assert_eq!(
             tools_hyperv,
-            Some(HerramientasGuest {
-                tipo: "Hyper-V Integration Services".to_string(),
+            Some(GuestTools {
+                kind: "Hyper-V Integration Services".to_string(),
                 version: Some("5.15.0-91.101".to_string()),
-                presente: true,
+                present: true,
             })
         );
     }

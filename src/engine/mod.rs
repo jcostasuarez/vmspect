@@ -1,13 +1,13 @@
-//! Motor de procesamiento concurrente, coordinación de tareas y Graceful Shutdown.
+//! Concurrency processing engine, task coordination and Graceful Shutdown.
 
 use crate::error::{Result, VmSpectError};
-use crate::models::options::{InspectionProgress, Opciones, ProgresoInspeccion};
-use crate::models::traits::ResultadoAnalisis;
-use crate::models::InformeInspeccion;
+use crate::models::options::{InspectionProgress, InspectionProgressEvent, Options};
+use crate::models::traits::AnalysisResult;
+use crate::models::InspectionReport;
 use crate::parsers;
 use crate::vms;
-use crate::vms::nbd::{self, LectorNbd};
-use crate::vms::stream::{identificar_imagen, LectorDisco};
+use crate::vms::nbd::{self, NbdReader};
+use crate::vms::stream::{identify_image, DiskReader};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,24 +15,25 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-/// Procesador concurrente con soporte para Graceful Shutdown y reporte de progreso lock-free.
-pub struct ProcesadorConcurrente;
+/// Concurrent processor with Graceful Shutdown support and lock-free progress reporting.
+pub struct ConcurrentProcessor;
 
-impl ProcesadorConcurrente {
-    /// Ejecuta una serie de tareas en paralelo utilizando un pool de workers con soporte para Graceful Shutdown y preservación de resultados parciales.
+impl ConcurrentProcessor {
+    /// Runs a series of tasks in parallel using a worker pool with Graceful Shutdown support
+    /// and partial-result preservation.
     ///
-    /// # Garantías de Graceful Shutdown:
-    /// 1. Si `cancel_token` está activo antes de comenzar o se activa durante la ejecución:
-    ///    - No se extraen ni inician nuevas tareas pendientes de la cola.
-    ///    - Los workers que estén procesando una tarea terminan de forma segura y liberan sus recursos.
-    /// 2. La función espera obligatoriamente a que **todos** los hilos activos finalicen mediante `.join()`.
-    /// 3. **Preservación de Resultados Parciales**: Si se solicita la cancelación, la función **no** descarta
-    ///    los resultados ya completados; devuelve la lista con todos los resultados procesados exitosamente
-    ///    hasta el momento de la cancelación.
-    pub fn procesar_en_paralelo<T, R, F>(
+    /// # Graceful Shutdown guarantees:
+    /// 1. If `cancel_token` is active before starting or becomes active during execution:
+    ///    - No new pending tasks are pulled from the queue or started.
+    ///    - Workers currently processing a task finish safely and release their resources.
+    /// 2. The function strictly waits for **all** active threads to finish via `.join()`.
+    /// 3. **Partial Result Preservation**: If cancellation is requested, the function **does not**
+    ///    discard results already completed; it returns the list of all successfully processed
+    ///    results up to the moment of cancellation.
+    pub fn process_in_parallel<T, R, F>(
         items: Vec<T>,
         cancel_token: Option<Arc<AtomicBool>>,
-        progreso: Option<Arc<InspectionProgress>>,
+        progress: Option<Arc<InspectionProgress>>,
         max_workers: usize,
         f: F,
     ) -> Result<Vec<R>>
@@ -45,77 +46,76 @@ impl ProcesadorConcurrente {
             return Ok(Vec::new());
         }
 
-        // Si ya está cancelado al inicio, no inicia hilos y retorna vector vacío
+        // If already cancelled at the start, do not spawn threads and return an empty vector
         if let Some(ref cancel) = cancel_token {
             if cancel.load(Ordering::Acquire) {
                 return Ok(Vec::new());
             }
         }
 
-        if let Some(ref p) = progreso {
+        if let Some(ref p) = progress {
             p.set_total_tasks(items.len());
         }
 
         let total_items = items.len();
         let num_workers = max_workers.max(1).min(total_items).min(32);
 
-        let cola = Arc::new(Mutex::new(
+        let queue = Arc::new(Mutex::new(
             items
                 .into_iter()
                 .enumerate()
                 .collect::<VecDeque<(usize, T)>>(),
         ));
-        let resultados = Arc::new(Mutex::new(Vec::<(usize, R)>::with_capacity(total_items)));
-        let error_almacenado = Arc::new(Mutex::new(None::<VmSpectError>));
+        let results = Arc::new(Mutex::new(Vec::<(usize, R)>::with_capacity(total_items)));
+        let stored_error = Arc::new(Mutex::new(None::<VmSpectError>));
         let f = Arc::new(f);
 
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(num_workers);
 
         for worker_id in 0..num_workers {
-            let cola_clone = Arc::clone(&cola);
-            let resultados_clone = Arc::clone(&resultados);
-            let error_clone = Arc::clone(&error_almacenado);
+            let queue_clone = Arc::clone(&queue);
+            let results_clone = Arc::clone(&results);
+            let error_clone = Arc::clone(&stored_error);
             let cancel_clone = cancel_token.clone();
-            let progreso_clone = progreso.clone();
+            let progress_clone = progress.clone();
             let f_clone = Arc::clone(&f);
 
             let builder = std::thread::Builder::new().name(format!("vmspect-worker-{}", worker_id));
 
             let handle = builder.spawn(move || {
                 loop {
-                    // 1. Verificar cancelación antes de desencolar una nueva tarea
+                    // 1. Check cancellation before dequeuing a new task
                     if let Some(ref cancel) = cancel_clone {
                         if cancel.load(Ordering::Acquire) {
                             break;
                         }
                     }
 
-                    // 2. Extraer la siguiente tarea
-                    let tarea = {
-                        let mut q = cola_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    // 2. Pull the next task
+                    let task = {
+                        let mut q = queue_clone.lock().unwrap_or_else(|e| e.into_inner());
                         q.pop_front()
                     };
 
-                    let Some((idx, item)) = tarea else {
+                    let Some((idx, item)) = task else {
                         break;
                     };
 
-                    // 3. Verificar cancelación inmediatamente antes de iniciar el procesamiento
+                    // 3. Check cancellation immediately before starting processing
                     if let Some(ref cancel) = cancel_clone {
                         if cancel.load(Ordering::Acquire) {
                             break;
                         }
                     }
 
-                    // 4. Ejecutar la tarea de forma segura y liberar recursos normalmente
-                    let resultado = f_clone(item);
+                    // 4. Run the task safely and release resources normally
+                    let result = f_clone(item);
 
-                    match resultado {
-                        Ok(valor) => {
-                            let mut res =
-                                resultados_clone.lock().unwrap_or_else(|e| e.into_inner());
-                            res.push((idx, valor));
-                            if let Some(ref p) = progreso_clone {
+                    match result {
+                        Ok(value) => {
+                            let mut res = results_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            res.push((idx, value));
+                            if let Some(ref p) = progress_clone {
                                 p.increment_completed_tasks();
                             }
                         }
@@ -138,19 +138,19 @@ impl ProcesadorConcurrente {
             }
         }
 
-        // 5. Graceful Shutdown: esperar rigurosamente a que todos los hilos terminen
+        // 5. Graceful Shutdown: rigorously wait for every thread to finish
         for handle in handles {
             let _ = handle.join();
         }
 
-        // 6. Si hubo un error no relacionado con cancelación y no hay cancelación activa
-        let fue_cancelado = cancel_token
+        // 6. If there was an error unrelated to cancellation and no active cancellation
+        let was_cancelled = cancel_token
             .as_ref()
             .map(|c| c.load(Ordering::Acquire))
             .unwrap_or(false);
 
-        if !fue_cancelado {
-            if let Some(err) = error_almacenado
+        if !was_cancelled {
+            if let Some(err) = stored_error
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -159,219 +159,165 @@ impl ProcesadorConcurrente {
             }
         }
 
-        // 7. Preservar y devolver todos los resultados completados (incluidos los terminados durante el shutdown)
-        let mut res = Arc::try_unwrap(resultados)
+        // 7. Preserve and return all completed results (including those finished during shutdown)
+        let mut res = Arc::try_unwrap(results)
             .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
             .unwrap_or_else(|m| std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner())));
         res.sort_by_key(|(idx, _)| *idx);
         Ok(res.into_iter().map(|(_, val)| val).collect())
     }
 
-    /// Procesa e inspecciona un conjunto de imágenes de disco en paralelo.
+    /// Processes and inspects a set of disk images in parallel.
     ///
-    /// Preserva los [`InformeInspeccion`] completados incluso si se cancela la operación.
-    pub fn inspeccionar_imagenes<P: AsRef<Path> + Send + 'static>(
-        rutas: Vec<P>,
-        opciones: &Opciones,
+    /// Preserves the [`InspectionReport`]s that completed even if the operation is cancelled.
+    pub fn inspect_images<P: AsRef<Path> + Send + 'static>(
+        paths: Vec<P>,
+        options: &Options,
         max_workers: usize,
-    ) -> Result<Vec<InformeInspeccion>> {
-        let opciones = opciones.clone();
-        let cancel = opciones.cancel_token.clone();
-        Self::procesar_en_paralelo(rutas, cancel, None, max_workers, move |ruta| {
-            let motor = MotorInspeccion::new(opciones.clone());
-            motor.inspeccionar(ruta.as_ref())
+    ) -> Result<Vec<InspectionReport>> {
+        let options = options.clone();
+        let cancel = options.cancel_token.clone();
+        Self::process_in_parallel(paths, cancel, None, max_workers, move |path| {
+            let engine = InspectionEngine::new(options.clone());
+            engine.inspect(path.as_ref())
         })
     }
 }
 
-/// Motor de inspección con soporte de concurrencia, métricas lock-free y parada limpia (Graceful Shutdown).
+/// Inspection engine with concurrency support, lock-free metrics and clean shutdown (Graceful Shutdown).
 #[derive(Debug, Clone)]
-pub struct MotorInspeccion {
-    opciones: Opciones,
-    progreso: Arc<InspectionProgress>,
+pub struct InspectionEngine {
+    options: Options,
+    progress: Arc<InspectionProgress>,
     cancel_token: Arc<AtomicBool>,
 }
 
-impl Default for MotorInspeccion {
+impl Default for InspectionEngine {
     fn default() -> Self {
-        Self::new(Opciones::default())
+        Self::new(Options::default())
     }
 }
 
-impl MotorInspeccion {
-    /// Crea un nuevo motor de inspección con las opciones proporcionadas.
-    pub fn new(opciones: Opciones) -> Self {
-        let cancel_token = opciones
+impl InspectionEngine {
+    /// Creates a new inspection engine with the provided options.
+    pub fn new(options: Options) -> Self {
+        let cancel_token = options
             .cancel_token
             .clone()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
-        let progreso = Arc::new(InspectionProgress::con_token_cancelacion(Some(
+        let progress = Arc::new(InspectionProgress::with_cancellation_token(Some(
             &cancel_token,
         )));
 
-        let mut opciones = opciones;
-        opciones.cancel_token = Some(cancel_token.clone());
+        let mut options = options;
+        options.cancel_token = Some(cancel_token.clone());
 
         Self {
-            opciones,
-            progreso,
+            options,
+            progress,
             cancel_token,
         }
     }
 
-    /// Alias constructor para inicialización fluida con opciones personalizadas.
-    pub fn with_options(opciones: Opciones) -> Self {
-        Self::new(opciones)
+    /// Constructor alias for fluent initialization with custom options.
+    pub fn with_options(options: Options) -> Self {
+        Self::new(options)
     }
 
-    /// Obtiene una referencia compartida a la estructura atómica de progreso ([`InspectionProgress`]).
+    /// Returns a shared reference to the atomic progress structure ([`InspectionProgress`]).
     ///
-    /// Permite a clientes (GUI/CLI/servicios) consultar métricas y porcentaje de forma lock-free.
+    /// Allows clients (GUI/CLI/services) to query metrics and percentage in a lock-free way.
     pub fn progress(&self) -> Arc<InspectionProgress> {
-        self.progreso.clone()
+        self.progress.clone()
     }
 
-    /// Alias en español para [`progress`].
-    pub fn progreso(&self) -> Arc<InspectionProgress> {
-        self.progress()
-    }
-
-    /// Consulta directa del porcentaje de completitud actual `[0.0, 100.0]`.
-    /// Operación thread-safe, de bajo costo y lock-free.
+    /// Direct query of the current completion percentage `[0.0, 100.0]`.
+    /// Thread-safe, low-cost, lock-free operation.
     pub fn completion_percentage(&self) -> f32 {
-        self.progreso.completion_percentage()
+        self.progress.completion_percentage()
     }
 
-    /// Alias en español para [`completion_percentage`].
-    pub fn porcentaje_completitud(&self) -> f32 {
-        self.completion_percentage()
-    }
-
-    /// Solicita la cancelación inmediata y limpia de la inspección.
+    /// Requests immediate and clean cancellation of the inspection.
     pub fn cancel(&self) {
         self.cancel_token.store(true, Ordering::Release);
-        self.progreso.cancel();
+        self.progress.cancel();
     }
 
-    /// Alias en español para [`cancel`].
-    pub fn cancelar(&self) {
-        self.cancel();
-    }
-
-    /// Indica si el análisis actual ha sido cancelado (lock-free).
+    /// Indicates whether the current analysis has been cancelled (lock-free).
     pub fn is_cancelled(&self) -> bool {
-        self.cancel_token.load(Ordering::Acquire) || self.progreso.is_cancelled()
+        self.cancel_token.load(Ordering::Acquire) || self.progress.is_cancelled()
     }
 
-    /// Alias en español para [`is_cancelled`].
-    pub fn esta_cancelado(&self) -> bool {
-        self.is_cancelled()
+    /// Runs the inspection of the disk image synchronously.
+    pub fn inspect(&self, image_path: &Path) -> Result<InspectionReport> {
+        self.run_inspection(image_path, None)
     }
 
-    /// Ejecuta la inspección de la imagen de disco de forma síncrona.
-    pub fn inspeccionar(&self, ruta_imagen: &Path) -> Result<InformeInspeccion> {
-        self.ejecutar_inspeccion(ruta_imagen, None)
-    }
-
-    /// Alias en inglés para [`inspeccionar`].
-    pub fn inspect(&self, ruta_imagen: &Path) -> Result<InformeInspeccion> {
-        self.inspeccionar(ruta_imagen)
-    }
-
-    /// Ejecuta la inspección notificando eventos estructurados a un callback.
-    pub fn inspeccionar_con_progreso<F>(
-        &self,
-        ruta_imagen: &Path,
-        mut callback: F,
-    ) -> Result<InformeInspeccion>
-    where
-        F: FnMut(ProgresoInspeccion),
-    {
-        self.ejecutar_inspeccion(ruta_imagen, Some(&mut callback))
-    }
-
-    /// Alias en inglés para [`inspeccionar_con_progreso`].
+    /// Runs the inspection notifying structured events to a callback.
     pub fn inspect_with_progress<F>(
         &self,
-        ruta_imagen: &Path,
-        callback: F,
-    ) -> Result<InformeInspeccion>
+        image_path: &Path,
+        mut callback: F,
+    ) -> Result<InspectionReport>
     where
-        F: FnMut(ProgresoInspeccion),
+        F: FnMut(InspectionProgressEvent),
     {
-        self.inspeccionar_con_progreso(ruta_imagen, callback)
+        self.run_inspection(image_path, Some(&mut callback))
     }
 
-    /// Inicia la inspección en un hilo de fondo dedicado, devolviendo un [`JoinHandle`].
+    /// Starts the inspection in a dedicated background thread, returning a [`JoinHandle`].
     ///
-    /// # Errores
+    /// # Errors
     ///
-    /// Devuelve [`VmSpectError::Io`] si el sistema operativo no puede crear un nuevo hilo
-    /// (por ejemplo, por agotamiento de recursos). La propia inspección, una vez en marcha,
-    /// reporta sus errores a través del [`Result`] interno del [`JoinHandle`].
-    pub fn inspeccionar_en_segundo_plano(
+    /// Returns [`VmSpectError::Io`] if the operating system cannot create a new thread
+    /// (e.g. due to resource exhaustion). The actual inspection, once started, reports
+    /// its errors through the inner [`Result`] of the [`JoinHandle`].
+    pub fn inspect_background(
         &self,
-        ruta_imagen: &Path,
-    ) -> Result<std::thread::JoinHandle<Result<InformeInspeccion>>> {
-        let motor = self.clone();
-        let ruta = ruta_imagen.to_path_buf();
+        image_path: &Path,
+    ) -> Result<std::thread::JoinHandle<Result<InspectionReport>>> {
+        let engine = self.clone();
+        let path = image_path.to_path_buf();
         std::thread::Builder::new()
             .name("vmspect-bg-inspect".to_string())
-            .spawn(move || motor.inspeccionar(&ruta))
+            .spawn(move || engine.inspect(&path))
             .map_err(VmSpectError::Io)
     }
 
-    /// Alias en inglés para [`inspeccionar_en_segundo_plano`].
-    pub fn inspect_background(
-        &self,
-        ruta_imagen: &Path,
-    ) -> Result<std::thread::JoinHandle<Result<InformeInspeccion>>> {
-        self.inspeccionar_en_segundo_plano(ruta_imagen)
-    }
-
-    /// Inspecciona un conjunto de imágenes de disco en paralelo usando múltiples workers.
+    /// Inspects a set of disk images in parallel using multiple workers.
     ///
-    /// Preserva los resultados procesados antes y durante la solicitud de cancelación.
-    pub fn inspeccionar_lote<P: AsRef<Path> + Send + 'static>(
+    /// Preserves results processed before and during the cancellation request.
+    pub fn inspect_batch<P: AsRef<Path> + Send + 'static>(
         &self,
-        rutas: Vec<P>,
+        paths: Vec<P>,
         max_workers: usize,
-    ) -> Result<Vec<InformeInspeccion>> {
-        let opciones = self.opciones.clone();
+    ) -> Result<Vec<InspectionReport>> {
+        let options = self.options.clone();
         let cancel = Some(self.cancel_token.clone());
-        let progreso = Some(self.progreso.clone());
-        ProcesadorConcurrente::procesar_en_paralelo(
-            rutas,
+        let progress = Some(self.progress.clone());
+        ConcurrentProcessor::process_in_parallel(
+            paths,
             cancel,
-            progreso,
+            progress,
             max_workers,
-            move |ruta| {
-                let motor = MotorInspeccion::new(opciones.clone());
-                motor.inspeccionar(ruta.as_ref())
+            move |path| {
+                let engine = InspectionEngine::new(options.clone());
+                engine.inspect(path.as_ref())
             },
         )
     }
 
-    /// Alias en inglés para [`inspeccionar_lote`].
-    pub fn inspect_batch<P: AsRef<Path> + Send + 'static>(
+    fn run_inspection(
         &self,
-        rutas: Vec<P>,
-        max_workers: usize,
-    ) -> Result<Vec<InformeInspeccion>> {
-        self.inspeccionar_lote(rutas, max_workers)
-    }
+        image_path: &Path,
+        mut callback: Option<&mut dyn FnMut(InspectionProgressEvent)>,
+    ) -> Result<InspectionReport> {
+        let start = Instant::now();
 
-    fn ejecutar_inspeccion(
-        &self,
-        ruta_imagen: &Path,
-        mut callback: Option<&mut dyn FnMut(ProgresoInspeccion)>,
-    ) -> Result<InformeInspeccion> {
-        let inicio = Instant::now();
-
-        if !ruta_imagen.exists() {
+        if !image_path.exists() {
             return Err(VmSpectError::ImageNotFound(
-                ruta_imagen.display().to_string(),
+                image_path.display().to_string(),
             ));
         }
 
@@ -379,63 +325,63 @@ impl MotorInspeccion {
             return Err(VmSpectError::Cancelled);
         }
 
-        let mut opciones_efectivas = self.opciones.clone();
-        opciones_efectivas.cancel_token = Some(self.cancel_token.clone());
+        let mut effective_options = self.options.clone();
+        effective_options.cancel_token = Some(self.cancel_token.clone());
 
-        // --- ETAPA 1 (5% - 15%): Identificación de la Imagen ---
-        self.progreso.set_stage_id(1);
-        self.progreso.set_percentage(5);
+        // --- STAGE 1 (5% - 15%): Image identification ---
+        self.progress.set_stage_id(1);
+        self.progress.set_percentage(5);
         if let Some(ref mut cb) = callback {
-            cb(ProgresoInspeccion {
-                porcentaje: 5,
-                etapa: "Identificando imagen de disco".into(),
-                detalle: Some(format!("Analizando {}", ruta_imagen.display())),
+            cb(InspectionProgressEvent {
+                percentage: 5,
+                stage: "Identifying disk image".into(),
+                detail: Some(format!("Analyzing {}", image_path.display())),
             });
         }
 
-        let imagen = identificar_imagen(opciones_efectivas.qemu_nbd.as_deref(), ruta_imagen)?;
+        let image = identify_image(effective_options.qemu_nbd.as_deref(), image_path)?;
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
         }
 
-        self.progreso.set_total_bytes(imagen.tamano_virtual);
-        self.progreso.set_percentage(15);
+        self.progress.set_total_bytes(image.virtual_size);
+        self.progress.set_percentage(15);
         if let Some(ref mut cb) = callback {
-            cb(ProgresoInspeccion {
-                porcentaje: 15,
-                etapa: "Inicializando backend de lectura".into(),
-                detalle: Some(format!(
-                    "Formato: {} | Hipervisor: {} | Tamaño: {}",
-                    imagen.formato,
-                    imagen.hipervisor.nombre(),
-                    crate::models::formatear_bytes(imagen.tamano_virtual)
+            cb(InspectionProgressEvent {
+                percentage: 15,
+                stage: "Initializing read backend".into(),
+                detail: Some(format!(
+                    "Format: {} | Hypervisor: {} | Size: {}",
+                    image.format,
+                    image.hypervisor.name(),
+                    crate::models::format_bytes(image.virtual_size)
                 )),
             });
         }
 
-        let lector = if opciones_efectivas.forzar_nbd {
-            let ruta_nbd = match nbd::resolver_qemu_nbd(opciones_efectivas.qemu_nbd.as_deref()) {
+        let reader = if effective_options.force_nbd {
+            let nbd_path = match nbd::resolve_qemu_nbd(effective_options.qemu_nbd.as_deref()) {
                 Ok(r) => r,
                 Err(_) => {
                     return Err(VmSpectError::QemuNotFound(
-                        "No se encontró el ejecutable qemu-nbd en el sistema".to_string(),
+                        "qemu-nbd executable was not found on the system".to_string(),
                     ));
                 }
             };
-            let lector_nbd = LectorNbd::abrir_con_opciones(&ruta_nbd, &imagen, &opciones_efectivas)
+            let nbd_reader = NbdReader::open_with_options(&nbd_path, &image, &effective_options)
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::Interrupted => VmSpectError::Cancelled,
                     _ => VmSpectError::Nbd(e.to_string()),
                 })?;
-            LectorDisco::desde_nbd(lector_nbd, &imagen, Some(self.cancel_token.clone()))
+            DiskReader::from_nbd(nbd_reader, &image, Some(self.cancel_token.clone()))
         } else {
-            match LectorDisco::abrir_con_opciones(&imagen, &opciones_efectivas) {
-                Ok(l) => l,
+            match DiskReader::open_with_options(&image, &effective_options) {
+                Ok(r) => r,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::NotFound {
                         return Err(VmSpectError::QemuNotFound(
-                            "No se encontró el ejecutable qemu-nbd en el sistema".to_string(),
+                            "qemu-nbd executable was not found on the system".to_string(),
                         ));
                     }
                     if e.kind() == std::io::ErrorKind::Interrupted {
@@ -446,144 +392,133 @@ impl MotorInspeccion {
             }
         };
 
-        let tamano_chunk = opciones_efectivas
-            .tamano_chunk
-            .unwrap_or_else(|| lector.tamano_chunk_recomendado());
+        let chunk_size = effective_options
+            .chunk_size
+            .unwrap_or_else(|| reader.recommended_chunk_size());
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
         }
 
-        // --- ETAPA 2 (25% - 45%): Detección de Particiones ---
-        self.progreso.set_stage_id(2);
-        self.progreso.set_percentage(25);
+        // --- STAGE 2 (25% - 45%): Partition detection ---
+        self.progress.set_stage_id(2);
+        self.progress.set_percentage(25);
         if let Some(ref mut cb) = callback {
-            cb(ProgresoInspeccion {
-                porcentaje: 25,
-                etapa: "Leyendo tabla de particiones".into(),
-                detalle: Some(format!(
-                    "Acceso: {} | Chunk size: {}",
-                    lector.modo_acceso(),
-                    crate::models::formatear_bytes(tamano_chunk)
+            cb(InspectionProgressEvent {
+                percentage: 25,
+                stage: "Reading partition table".into(),
+                detail: Some(format!(
+                    "Access: {} | Chunk size: {}",
+                    reader.access_mode(),
+                    crate::models::format_bytes(chunk_size)
                 )),
             });
         }
 
-        let disco = vms::detector::detectar_con_progreso(
-            &lector,
+        let disk = vms::detector::detect_with_progress(
+            &reader,
             Some(self.cancel_token.clone()),
-            Some(self.progreso.clone()),
+            Some(self.progress.clone()),
         )?;
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
         }
 
-        self.progreso.set_percentage(45);
+        self.progress.set_percentage(45);
         if let Some(ref mut cb) = callback {
-            cb(ProgresoInspeccion {
-                porcentaje: 45,
-                etapa: "Analizando sistemas de archivos".into(),
-                detalle: Some(format!(
-                    "{} particiones encontradas. SO detectado: {:?}",
-                    disco.particiones.len(),
-                    disco.sistema_operativo
+            cb(InspectionProgressEvent {
+                percentage: 45,
+                stage: "Analyzing file systems".into(),
+                detail: Some(format!(
+                    "{} partitions found. OS detected: {:?}",
+                    disk.partitions.len(),
+                    disk.operating_system
                 )),
             });
         }
 
-        // --- ETAPA 3 (55% - 85%): Análisis del Sistema Operativo ---
-        self.progreso.set_stage_id(3);
-        self.progreso.set_percentage(55);
+        // --- STAGE 3 (55% - 85%): Operating system analysis ---
+        self.progress.set_stage_id(3);
+        self.progress.set_percentage(55);
         if let Some(ref mut cb) = callback {
-            cb(ProgresoInspeccion {
-                porcentaje: 55,
-                etapa: format!(
-                    "Analizando sistema operativo ({:?})",
-                    disco.sistema_operativo
-                ),
-                detalle: Some("Iniciando escaneo de archivos del sistema / Registro".into()),
+            cb(InspectionProgressEvent {
+                percentage: 55,
+                stage: format!("Analyzing operating system ({:?})", disk.operating_system),
+                detail: Some("Starting system files / Registry scan".into()),
             });
         }
 
-        // Graceful Degradation: un fallo durante el análisis del sistema operativo
-        // invitado (ej. Registro de Windows sucio/corrupto) NO debe abortar el
-        // pipeline completo. Se registra como advertencia y se continua con los
-        // datos de imagen, particiones y sistemas de archivos ya recopilados.
-        let resultado = if opciones_efectivas.debe_analizar_sistema()
-            || opciones_efectivas.debe_analizar_apps()
+        // Graceful Degradation: a failure during the guest OS analysis
+        // (e.g. dirty/corrupt Windows Registry) must NOT abort the
+        // entire pipeline. It is logged as a warning and inspection
+        // continues with already-collected image, partition and FS data.
+        let result = if effective_options.should_analyze_system()
+            || effective_options.should_analyze_apps()
         {
-            let inspector = parsers::obtener_inspector(&disco.sistema_operativo);
-            match inspector.analizar(
-                &lector,
-                &disco.particiones,
-                tamano_chunk,
-                &opciones_efectivas,
-            ) {
+            let inspector = parsers::get_inspector(&disk.operating_system);
+            match inspector.analyze(&reader, &disk.partitions, chunk_size, &effective_options) {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!(
-                        "No se pudo completar el análisis del sistema operativo invitado, se continúa solo con los datos de imagen/particiones: {}",
+                        "Could not complete the guest OS analysis; continuing with image/partition data only: {}",
                         e
                     );
                     tracing::warn!("{}", msg);
-                    ResultadoAnalisis {
-                        advertencias: vec![msg],
-                        ..ResultadoAnalisis::default()
+                    AnalysisResult {
+                        warnings: vec![msg],
+                        ..AnalysisResult::default()
                     }
                 }
             }
         } else {
-            ResultadoAnalisis::default()
+            AnalysisResult::default()
         };
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
         }
 
-        // --- ETAPA 4 (90% - 100%): Consolidación e Informe ---
-        self.progreso.set_stage_id(4);
-        self.progreso.set_percentage(90);
+        // --- STAGE 4 (90% - 100%): Consolidation and report ---
+        self.progress.set_stage_id(4);
+        self.progress.set_percentage(90);
         if let Some(ref mut cb) = callback {
-            cb(ProgresoInspeccion {
-                porcentaje: 90,
-                etapa: "Generando informe final".into(),
-                detalle: Some(format!(
-                    "{} programas/paquetes identificados",
-                    resultado.programas.len()
+            cb(InspectionProgressEvent {
+                percentage: 90,
+                stage: "Generating final report".into(),
+                detail: Some(format!(
+                    "{} programs/packages identified",
+                    result.programs.len()
                 )),
             });
         }
 
-        let mut estadisticas = lector.estadisticas();
-        estadisticas.duracion_ms = inicio.elapsed().as_millis() as u64;
+        let mut stats = reader.stats();
+        stats.duration_ms = start.elapsed().as_millis() as u64;
 
-        let informe = InformeInspeccion {
-            imagen,
-            esquema: disco.esquema,
-            particiones: disco.particiones,
-            sistema_operativo: disco.sistema_operativo,
-            vm_info: resultado.vm_info,
-            programas: resultado.programas,
-            advertencias: resultado.advertencias,
-            estadisticas,
+        let report = InspectionReport {
+            image,
+            scheme: disk.scheme,
+            partitions: disk.partitions,
+            operating_system: disk.operating_system,
+            guest_info: result.guest_info,
+            installed_programs: result.programs,
+            warnings: result.warnings,
+            stats,
         };
 
-        self.progreso.set_percentage(100);
+        self.progress.set_percentage(100);
         if let Some(ref mut cb) = callback {
-            cb(ProgresoInspeccion {
-                porcentaje: 100,
-                etapa: "Análisis completado exitosamente".into(),
-                detalle: None,
+            cb(InspectionProgressEvent {
+                percentage: 100,
+                stage: "Analysis completed successfully".into(),
+                detail: None,
             });
         }
 
-        Ok(informe)
+        Ok(report)
     }
 }
-
-/// Alias en inglés para [`MotorInspeccion`].
-pub type InspectionEngine = MotorInspeccion;
 
 #[cfg(test)]
 mod tests {
@@ -593,7 +528,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_progreso_atomico_metadatos_y_porcentaje() {
+    fn test_atomic_progress_metadata_and_percentage() {
         let prog = InspectionProgress::new();
         assert_eq!(prog.completion_percentage(), 0.0);
         assert!(!prog.is_cancelled());
@@ -617,60 +552,60 @@ mod tests {
         assert_eq!(prog.stage_id(), 3);
 
         let snap = prog.snapshot();
-        assert_eq!(snap.porcentaje, 50);
-        assert_eq!(snap.etapa_id, 3);
-        assert_eq!(snap.tareas_completadas, 2);
-        assert_eq!(snap.total_tareas, 10);
-        assert_eq!(snap.bytes_procesados, 2048);
-        assert_eq!(snap.bytes_totales, 4096);
-        assert!(!snap.cancelado);
+        assert_eq!(snap.percentage, 50);
+        assert_eq!(snap.stage_id, 3);
+        assert_eq!(snap.completed_tasks, 2);
+        assert_eq!(snap.total_tasks, 10);
+        assert_eq!(snap.bytes_processed, 2048);
+        assert_eq!(snap.total_bytes, 4096);
+        assert!(!snap.cancelled);
 
         prog.cancel();
         assert!(prog.is_cancelled());
-        assert!(prog.snapshot().cancelado);
+        assert!(prog.snapshot().cancelled);
     }
 
     #[test]
-    fn test_procesador_concurrente_ejecucion_normal() {
+    fn test_concurrent_processor_normal_execution() {
         let items: Vec<u32> = (1..=20).collect();
         let cancel = Arc::new(AtomicBool::new(false));
         let prog = Arc::new(InspectionProgress::new());
 
-        let resultados = ProcesadorConcurrente::procesar_en_paralelo(
+        let results = ConcurrentProcessor::process_in_parallel(
             items.clone(),
             Some(cancel),
             Some(prog.clone()),
             4,
             |x| Ok(x * 2),
         )
-        .expect("procesamiento paralelo exitoso");
+        .expect("parallel processing successful");
 
-        assert_eq!(resultados.len(), 20);
-        for (i, &val) in resultados.iter().enumerate() {
+        assert_eq!(results.len(), 20);
+        for (i, &val) in results.iter().enumerate() {
             assert_eq!(val, (i as u32 + 1) * 2);
         }
         assert_eq!(prog.completed_tasks(), 20);
     }
 
     #[test]
-    fn test_procesador_concurrente_graceful_shutdown_cancelacion() {
+    fn test_concurrent_processor_graceful_shutdown_cancellation() {
         let items: Vec<u32> = (1..=50).collect();
         let cancel = Arc::new(AtomicBool::new(false));
         let prog = Arc::new(InspectionProgress::new());
 
-        let cancel_clon = cancel.clone();
+        let cancel_clone = cancel.clone();
         let prog_worker = prog.clone();
-        let tareas_iniciadas = Arc::new(AtomicUsize::new(0));
-        let tareas_iniciadas_clon = tareas_iniciadas.clone();
+        let tasks_started = Arc::new(AtomicUsize::new(0));
+        let tasks_started_clone = tasks_started.clone();
 
         let handle = std::thread::spawn(move || {
-            ProcesadorConcurrente::procesar_en_paralelo(
+            ConcurrentProcessor::process_in_parallel(
                 items,
-                Some(cancel_clon),
+                Some(cancel_clone),
                 Some(prog_worker),
                 4,
                 move |_item| {
-                    let num = tareas_iniciadas_clon.fetch_add(1, Ordering::SeqCst);
+                    let num = tasks_started_clone.fetch_add(1, Ordering::SeqCst);
                     if num >= 2 {
                         sleep(Duration::from_millis(50));
                     }
@@ -679,48 +614,48 @@ mod tests {
             )
         });
 
-        // Espera determinista (acotada por un timeout de seguridad) a que al menos dos
-        // tareas rápidas hayan finalizado antes de cancelar. Evita una carrera contra el
-        // reloj que podría fallar de forma intermitente si el sistema está bajo carga.
-        let inicio_espera = Instant::now();
-        while prog.completed_tasks() < 2 && inicio_espera.elapsed() < Duration::from_secs(5) {
+        // Deterministic wait (bounded by a safety timeout) until at least two
+        // fast tasks have finished before cancelling. Avoids racing the clock,
+        // which can fail intermittently under load.
+        let wait_start = Instant::now();
+        while prog.completed_tasks() < 2 && wait_start.elapsed() < Duration::from_secs(5) {
             sleep(Duration::from_millis(1));
         }
         cancel.store(true, Ordering::Release);
 
-        let resultado = handle.join().expect("hilo coordinador finalizó");
-        let resultados_parciales = resultado.expect("debe preservar resultados parciales");
+        let result = handle.join().expect("coordinator thread finished");
+        let partial_results = result.expect("must preserve partial results");
         assert!(
-            !resultados_parciales.is_empty(),
-            "Debe haber preservado los resultados completados"
+            !partial_results.is_empty(),
+            "Must preserve the completed results"
         );
         assert!(
-            resultados_parciales.len() < 50,
-            "No debe procesar todos los elementos si fue cancelado"
+            partial_results.len() < 50,
+            "Must not process all items if cancelled"
         );
 
-        let total_iniciadas = tareas_iniciadas.load(Ordering::SeqCst);
+        let total_started = tasks_started.load(Ordering::SeqCst);
         assert!(
-            total_iniciadas < 50,
-            "Las tareas pendientes no deben haber iniciado tras la cancelación (iniciadas: {})",
-            total_iniciadas
+            total_started < 50,
+            "Pending tasks must not have started after cancellation (started: {})",
+            total_started
         );
     }
 
     #[test]
-    fn test_motor_inspeccion_api_consulta_progreso_y_cancelacion() {
-        let opciones = Opciones::default();
-        let motor = MotorInspeccion::new(opciones);
+    fn test_inspection_engine_progress_and_cancellation_api() {
+        let options = Options::default();
+        let engine = InspectionEngine::new(options);
 
-        assert_eq!(motor.completion_percentage(), 0.0);
-        assert!(!motor.is_cancelled());
+        assert_eq!(engine.completion_percentage(), 0.0);
+        assert!(!engine.is_cancelled());
 
-        let prog = motor.progress();
+        let prog = engine.progress();
         prog.set_percentage(75);
-        assert_eq!(motor.completion_percentage(), 75.0);
+        assert_eq!(engine.completion_percentage(), 75.0);
 
-        motor.cancel();
-        assert!(motor.is_cancelled());
-        assert!(motor.progreso().is_cancelled());
+        engine.cancel();
+        assert!(engine.is_cancelled());
+        assert!(engine.progress().is_cancelled());
     }
 }

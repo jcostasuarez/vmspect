@@ -1,15 +1,15 @@
-//! Opciones de configuración, eventos de progreso e informe final de inspección.
+//! Configuration options, progress events and the final inspection report.
 
-use crate::models::image::{Estadisticas, InfoImagen};
-use crate::models::partition::{EsquemaParticion, Particion, SistemaOperativo};
-use crate::models::software::{Programa, VMInfo};
+use crate::models::image::{ImageInfo, Stats};
+use crate::models::partition::{OperatingSystem, Partition, PartitionScheme};
+use crate::models::software::{GuestInfo, Program};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Token de cancelación reutilizable basado en banderas atómicas.
+/// Reusable cancellation token based on atomic flags.
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
     inner: Arc<AtomicBool>,
@@ -22,85 +22,75 @@ impl Default for CancellationToken {
 }
 
 impl CancellationToken {
-    /// Crea un nuevo token de cancelación en estado no cancelado (`false`).
+    /// Creates a new cancellation token in the not-cancelled state (`false`).
     pub fn new() -> Self {
         Self {
             inner: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Crea un token a partir de un `Arc<AtomicBool>` existente.
+    /// Creates a token from an existing `Arc<AtomicBool>`.
     pub fn from_arc(inner: Arc<AtomicBool>) -> Self {
         Self { inner }
     }
 
-    /// Solicita la cancelación de las tareas asociadas.
+    /// Requests cancellation of the associated tasks.
     pub fn cancel(&self) {
         self.inner.store(true, Ordering::Release);
     }
 
-    /// Alias en español para [`cancel`].
-    pub fn cancelar(&self) {
-        self.cancel();
-    }
-
-    /// Indica si se ha solicitado la cancelación (lectura thread-safe lock-free con orden Acquire).
+    /// Indicates whether cancellation has been requested (thread-safe lock-free read with Acquire order).
     pub fn is_cancelled(&self) -> bool {
         self.inner.load(Ordering::Acquire)
     }
 
-    /// Alias en español para [`is_cancelled`].
-    pub fn esta_cancelado(&self) -> bool {
-        self.is_cancelled()
-    }
-
-    /// Obtiene una referencia al `Arc<AtomicBool>` interno.
+    /// Returns a reference to the inner `Arc<AtomicBool>`.
     pub fn as_arc(&self) -> &Arc<AtomicBool> {
         &self.inner
     }
 
-    /// Clona el `Arc<AtomicBool>` interno.
+    /// Clones the inner `Arc<AtomicBool>`.
     pub fn clone_arc(&self) -> Arc<AtomicBool> {
         self.inner.clone()
     }
 }
 
-/// Instantánea inmutable del progreso para inspección externa o serialización.
+/// Immutable snapshot of the progress for external inspection or serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProgresoSnapshot {
-    /// Porcentaje de avance global (de 0 a 100).
-    pub porcentaje: u8,
-    /// Identificador numérico de la etapa en curso.
-    pub etapa_id: u8,
-    /// Cantidad de tareas completadas.
-    pub tareas_completadas: usize,
-    /// Total de tareas programadas.
-    pub total_tareas: usize,
-    /// Bytes leídos o procesados.
-    pub bytes_procesados: u64,
-    /// Total de bytes virtuales o esperados.
-    pub bytes_totales: u64,
-    /// Indica si el análisis ha sido cancelado.
-    pub cancelado: bool,
+pub struct ProgressSnapshot {
+    /// Global completion percentage (0..=100).
+    pub percentage: u8,
+    /// Numeric identifier of the current stage.
+    pub stage_id: u8,
+    /// Number of completed tasks.
+    pub completed_tasks: usize,
+    /// Total number of scheduled tasks.
+    pub total_tasks: usize,
+    /// Bytes read or processed.
+    pub bytes_processed: u64,
+    /// Total virtual or expected bytes.
+    pub total_bytes: u64,
+    /// Indicates whether the analysis has been cancelled.
+    pub cancelled: bool,
 }
 
-/// Métricas y progreso atómico de la inspección compartibles entre hilos sin bloqueos (lock-free).
+/// Atomic, lock-free metrics and progress shareable between threads.
 #[derive(Debug)]
 pub struct InspectionProgress {
-    /// Tareas totales estimadas o registradas.
-    pub total_tareas: AtomicUsize,
-    /// Tareas completadas.
-    pub tareas_completadas: AtomicUsize,
-    /// Bytes totales procesados.
-    pub bytes_procesados: AtomicU64,
-    /// Bytes totales estimados o conocidos.
-    pub bytes_totales: AtomicU64,
-    /// Porcentaje de completitud (0 a 100).
-    pub porcentaje: AtomicU8,
-    /// Código o ID de la etapa actual.
-    pub etapa_id: AtomicU8,
-    /// Flag atómico de cancelación.
-    pub cancelado: AtomicBool,
+    /// Total estimated or registered tasks.
+    pub total_tasks: AtomicUsize,
+    /// Completed tasks.
+    pub completed_tasks: AtomicUsize,
+    /// Total bytes processed.
+    pub bytes_processed: AtomicU64,
+    /// Total estimated or known bytes.
+    pub total_bytes: AtomicU64,
+    /// Completion percentage (0..=100).
+    pub percentage: AtomicU8,
+    /// Numeric ID of the current stage.
+    pub stage_id: AtomicU8,
+    /// Atomic cancellation flag.
+    pub cancelled: AtomicBool,
 }
 
 impl Default for InspectionProgress {
@@ -110,45 +100,45 @@ impl Default for InspectionProgress {
 }
 
 impl InspectionProgress {
-    /// Crea una nueva instancia con todos los contadores en cero.
+    /// Creates a new instance with all counters set to zero.
     pub fn new() -> Self {
         Self {
-            total_tareas: AtomicUsize::new(0),
-            tareas_completadas: AtomicUsize::new(0),
-            bytes_procesados: AtomicU64::new(0),
-            bytes_totales: AtomicU64::new(0),
-            porcentaje: AtomicU8::new(0),
-            etapa_id: AtomicU8::new(0),
-            cancelado: AtomicBool::new(false),
+            total_tasks: AtomicUsize::new(0),
+            completed_tasks: AtomicUsize::new(0),
+            bytes_processed: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            percentage: AtomicU8::new(0),
+            stage_id: AtomicU8::new(0),
+            cancelled: AtomicBool::new(false),
         }
     }
 
-    /// Crea una nueva instancia vinculada a un token de cancelación externo.
-    pub fn con_token_cancelacion(token: Option<&Arc<AtomicBool>>) -> Self {
-        let cancelado = if let Some(t) = token {
+    /// Creates a new instance linked to an external cancellation token.
+    pub fn with_cancellation_token(token: Option<&Arc<AtomicBool>>) -> Self {
+        let cancelled = if let Some(t) = token {
             AtomicBool::new(t.load(Ordering::Acquire))
         } else {
             AtomicBool::new(false)
         };
         Self {
-            total_tareas: AtomicUsize::new(0),
-            tareas_completadas: AtomicUsize::new(0),
-            bytes_procesados: AtomicU64::new(0),
-            bytes_totales: AtomicU64::new(0),
-            porcentaje: AtomicU8::new(0),
-            etapa_id: AtomicU8::new(0),
-            cancelado,
+            total_tasks: AtomicUsize::new(0),
+            completed_tasks: AtomicUsize::new(0),
+            bytes_processed: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            percentage: AtomicU8::new(0),
+            stage_id: AtomicU8::new(0),
+            cancelled,
         }
     }
 
-    /// Obtiene el porcentaje de completitud actual en punto flotante `[0.0, 100.0]`.
-    /// Operación lock-free de bajo costo basada en cargas atómicas con orden Relaxed.
+    /// Returns the current completion percentage as a floating-point value `[0.0, 100.0]`.
+    /// Low-cost lock-free operation based on atomic loads with Relaxed ordering.
     #[inline]
     pub fn completion_percentage(&self) -> f32 {
-        let pct = self.porcentaje.load(Ordering::Relaxed);
-        let total = self.total_tareas.load(Ordering::Relaxed);
+        let pct = self.percentage.load(Ordering::Relaxed);
+        let total = self.total_tasks.load(Ordering::Relaxed);
         if total > 0 {
-            let done = self.tareas_completadas.load(Ordering::Relaxed);
+            let done = self.completed_tasks.load(Ordering::Relaxed);
             let calc = (done as f32 / total as f32) * 100.0;
             calc.clamp(pct as f32, 100.0)
         } else {
@@ -156,254 +146,227 @@ impl InspectionProgress {
         }
     }
 
-    /// Alias en español para [`completion_percentage`].
-    #[inline]
-    pub fn porcentaje_completitud(&self) -> f32 {
-        self.completion_percentage()
-    }
-
-    /// Indica si el análisis ha recibido una señal de cancelación (lock-free, Acquire).
+    /// Indicates whether the analysis has received a cancellation signal (lock-free, Acquire).
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelado.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire)
     }
 
-    /// Alias en español para [`is_cancelled`].
-    #[inline]
-    pub fn esta_cancelado(&self) -> bool {
-        self.is_cancelled()
-    }
-
-    /// Señaliza la cancelación del análisis (Release).
+    /// Signals cancellation of the analysis (Release).
     #[inline]
     pub fn cancel(&self) {
-        self.cancelado.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
     }
 
-    /// Alias en español para [`cancel`].
-    #[inline]
-    pub fn cancelar(&self) {
-        self.cancel();
-    }
-
-    /// Establece el porcentaje global de avance (0..=100).
+    /// Sets the global progress percentage (0..=100).
     #[inline]
     pub fn set_percentage(&self, pct: u8) {
-        self.porcentaje.store(pct.min(100), Ordering::Relaxed);
+        self.percentage.store(pct.min(100), Ordering::Relaxed);
     }
 
-    /// Establece el identificador de la etapa actual.
+    /// Sets the identifier of the current stage.
     #[inline]
     pub fn set_stage_id(&self, stage: u8) {
-        self.etapa_id.store(stage, Ordering::Relaxed);
+        self.stage_id.store(stage, Ordering::Relaxed);
     }
 
-    /// Obtiene el identificador de la etapa actual.
+    /// Returns the identifier of the current stage.
     #[inline]
     pub fn stage_id(&self) -> u8 {
-        self.etapa_id.load(Ordering::Relaxed)
+        self.stage_id.load(Ordering::Relaxed)
     }
 
-    /// Suma bytes leídos o procesados de manera atómica.
+    /// Atomically adds to the bytes processed counter.
     #[inline]
     pub fn add_bytes_processed(&self, bytes: u64) {
-        self.bytes_procesados.fetch_add(bytes, Ordering::Relaxed);
+        self.bytes_processed.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Obtiene el número total de bytes procesados hasta ahora.
+    /// Returns the total number of bytes processed so far.
     #[inline]
     pub fn bytes_processed(&self) -> u64 {
-        self.bytes_procesados.load(Ordering::Relaxed)
+        self.bytes_processed.load(Ordering::Relaxed)
     }
 
-    /// Configura el tamaño total en bytes esperado para el análisis.
+    /// Sets the expected total byte size for the analysis.
     #[inline]
     pub fn set_total_bytes(&self, total: u64) {
-        self.bytes_totales.store(total, Ordering::Relaxed);
+        self.total_bytes.store(total, Ordering::Relaxed);
     }
 
-    /// Obtiene el total de bytes estimados.
+    /// Returns the total estimated bytes.
     #[inline]
     pub fn total_bytes(&self) -> u64 {
-        self.bytes_totales.load(Ordering::Relaxed)
+        self.total_bytes.load(Ordering::Relaxed)
     }
 
-    /// Configura el total de tareas estimadas en el plan de trabajo.
+    /// Configures the total number of estimated tasks in the work plan.
     #[inline]
     pub fn set_total_tasks(&self, total: usize) {
-        self.total_tareas.store(total, Ordering::Relaxed);
+        self.total_tasks.store(total, Ordering::Relaxed);
     }
 
-    /// Obtiene el total de tareas planificadas.
+    /// Returns the total number of planned tasks.
     #[inline]
     pub fn total_tasks(&self) -> usize {
-        self.total_tareas.load(Ordering::Relaxed)
+        self.total_tasks.load(Ordering::Relaxed)
     }
 
-    /// Incrementa en uno el contador de tareas completadas.
+    /// Increments the completed-tasks counter by one.
     #[inline]
     pub fn increment_completed_tasks(&self) {
-        self.tareas_completadas.fetch_add(1, Ordering::Relaxed);
+        self.completed_tasks.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Obtiene la cantidad de tareas completadas hasta el momento.
+    /// Returns the number of tasks completed so far.
     #[inline]
     pub fn completed_tasks(&self) -> usize {
-        self.tareas_completadas.load(Ordering::Relaxed)
+        self.completed_tasks.load(Ordering::Relaxed)
     }
 
-    /// Obtiene una instantánea inmutable del estado del progreso.
-    pub fn snapshot(&self) -> ProgresoSnapshot {
-        ProgresoSnapshot {
-            porcentaje: self.porcentaje.load(Ordering::Relaxed),
-            etapa_id: self.etapa_id.load(Ordering::Relaxed),
-            tareas_completadas: self.tareas_completadas.load(Ordering::Relaxed),
-            total_tareas: self.total_tareas.load(Ordering::Relaxed),
-            bytes_procesados: self.bytes_procesados.load(Ordering::Relaxed),
-            bytes_totales: self.bytes_totales.load(Ordering::Relaxed),
-            cancelado: self.cancelado.load(Ordering::Acquire),
+    /// Returns an immutable snapshot of the progress state.
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            percentage: self.percentage.load(Ordering::Relaxed),
+            stage_id: self.stage_id.load(Ordering::Relaxed),
+            completed_tasks: self.completed_tasks.load(Ordering::Relaxed),
+            total_tasks: self.total_tasks.load(Ordering::Relaxed),
+            bytes_processed: self.bytes_processed.load(Ordering::Relaxed),
+            total_bytes: self.total_bytes.load(Ordering::Relaxed),
+            cancelled: self.cancelled.load(Ordering::Acquire),
         }
     }
 }
 
-/// Opciones de ejecución pasadas al motor de inspección.
+/// Execution options passed to the inspection engine.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Opciones {
-    /// Si es `true`, desactiva la recolección de aplicaciones instaladas (`--noapps`).
-    pub noapps: bool,
-    /// Si es `true`, desactiva la recolección de información del sistema operativo (`--nosystem`).
-    pub nosystem: bool,
-    /// Si es `true`, fuerza la lectura de la colmena `SYSTEM` además de `SOFTWARE` en Windows.
-    pub incluir_system: bool,
-    /// Ruta explícita al binario `qemu-nbd`. Si es `None`, se busca automáticamente en el sistema.
+pub struct Options {
+    /// If `true`, disables collection of installed applications (`--no-apps`).
+    pub no_apps: bool,
+    /// If `true`, disables collection of operating system information (`--no-system`).
+    pub no_system: bool,
+    /// If `true`, forces reading of the `SYSTEM` hive in addition to `SOFTWARE` on Windows.
+    pub include_system: bool,
+    /// Explicit path to the `qemu-nbd` binary. If `None`, it is searched automatically.
     pub qemu_nbd: Option<PathBuf>,
-    /// Tamaño de chunk (bytes) utilizado por la caché de lectura. `None` establece el tamaño óptimo automático.
-    pub tamano_chunk: Option<u64>,
-    /// Si es `true`, fuerza el uso de `qemu-nbd` incluso si el formato admite lectura nativa en Rust.
-    pub forzar_nbd: bool,
-    /// Especifica la ruta a un socket de dominio UNIX (`--socket-path` / `-k` en qemu-nbd) en lugar del puerto TCP loopback por defecto.
-    pub socket_unix: Option<PathBuf>,
-    /// Pasa argumentos o flags CLI adicionales arbitrarios al subproceso `qemu-nbd` (ej. optimizaciones de caché, `--detect-zeroes`, etc.).
-    pub args_extra_nbd: Vec<String>,
-    /// Tiempo máximo de espera para que el servidor `qemu-nbd` esté listo y acepte conexiones (TCP o UNIX) durante el handshake inicial.
-    pub timeout_conexion: Option<Duration>,
-    /// Bandera para incluir opcionalmente `--persistent`. Por defecto es `false`.
-    pub persistente_nbd: bool,
-    /// Token de cancelación atómico opcional para abortar la inspección anticipadamente.
+    /// Chunk size (bytes) used by the read cache. `None` sets the automatic optimal size.
+    pub chunk_size: Option<u64>,
+    /// If `true`, forces the use of `qemu-nbd` even if the format admits native reading in Rust.
+    pub force_nbd: bool,
+    /// Specifies the path to a UNIX domain socket (`--socket-path` / `-k` in qemu-nbd) instead of
+    /// the default loopback TCP port.
+    pub unix_socket: Option<PathBuf>,
+    /// Passes arbitrary additional CLI arguments/flags to the `qemu-nbd` subprocess
+    /// (e.g. cache optimizations, `--detect-zeroes`, etc.).
+    pub extra_nbd_args: Vec<String>,
+    /// Maximum wait time for the `qemu-nbd` server to be ready and accept connections
+    /// (TCP or UNIX) during the initial handshake.
+    pub connection_timeout: Option<Duration>,
+    /// Flag to optionally include `--persistent`. Defaults to `false`.
+    pub nbd_persistent: bool,
+    /// Optional atomic cancellation token to abort the inspection early.
     #[serde(skip)]
     pub cancel_token: Option<Arc<AtomicBool>>,
 }
 
-/// Alias para [`Opciones`] bajo la nomenclatura `OpcionesInspeccion`.
-pub type OpcionesInspeccion = Opciones;
+/// Alias for [`Options`] under the `InspectionOptions` naming.
+pub type InspectionOptions = Options;
 
-impl Opciones {
-    /// Indica si se debe ejecutar el análisis y extracción de aplicaciones instaladas (retorna `!self.noapps`).
-    #[inline]
-    pub fn debe_analizar_apps(&self) -> bool {
-        !self.noapps
-    }
-
-    /// Alias en inglés para [`debe_analizar_apps`](Self::debe_analizar_apps).
+impl Options {
+    /// Indicates whether installed-application analysis should run (returns `!self.no_apps`).
     #[inline]
     pub fn should_analyze_apps(&self) -> bool {
-        self.debe_analizar_apps()
+        !self.no_apps
     }
 
-    /// Indica si se debe ejecutar el análisis y extracción de información del sistema operativo (retorna `!self.nosystem`).
-    #[inline]
-    pub fn debe_analizar_sistema(&self) -> bool {
-        !self.nosystem
-    }
-
-    /// Alias en inglés para [`debe_analizar_sistema`](Self::debe_analizar_sistema).
+    /// Indicates whether operating-system information analysis should run (returns `!self.no_system`).
     #[inline]
     pub fn should_analyze_system(&self) -> bool {
-        self.debe_analizar_sistema()
+        !self.no_system
     }
 
-    /// Asigna la ruta explícita al binario `qemu-nbd`.
+    /// Sets the explicit path to the `qemu-nbd` binary.
     pub fn with_qemu_nbd(mut self, path: PathBuf) -> Self {
         self.qemu_nbd = Some(path);
         self
     }
 
-    /// Configura si se debe forzar el uso del backend `qemu-nbd`.
-    pub fn with_forzar_nbd(mut self, forzar: bool) -> Self {
-        self.forzar_nbd = forzar;
+    /// Configures whether the `qemu-nbd` backend should be forced.
+    pub fn with_force_nbd(mut self, force: bool) -> Self {
+        self.force_nbd = force;
         self
     }
 
-    /// Asigna la ruta a un socket de dominio UNIX (`-k`) para la comunicación con `qemu-nbd`.
-    pub fn with_socket_unix(mut self, ruta: impl Into<PathBuf>) -> Self {
-        self.socket_unix = Some(ruta.into());
+    /// Sets the path to a UNIX domain socket (`-k`) for `qemu-nbd` communication.
+    pub fn with_unix_socket(mut self, path: impl Into<PathBuf>) -> Self {
+        self.unix_socket = Some(path.into());
         self
     }
 
-    /// Asigna argumentos o flags CLI adicionales para el subproceso `qemu-nbd`.
+    /// Sets additional CLI arguments/flags for the `qemu-nbd` subprocess.
     pub fn with_extra_nbd_args(mut self, args: Vec<String>) -> Self {
-        self.args_extra_nbd = args;
+        self.extra_nbd_args = args;
         self
     }
 
-    /// Define el tiempo máximo de espera para que el servidor `qemu-nbd` acepte la conexión inicial.
+    /// Defines the maximum wait time for the `qemu-nbd` server to accept the initial connection.
     pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout_conexion = Some(timeout);
+        self.connection_timeout = Some(timeout);
         self
     }
 
-    /// Configura si `qemu-nbd` debe ejecutarse con la bandera `--persistent`.
-    pub fn with_persistente_nbd(mut self, persistente: bool) -> Self {
-        self.persistente_nbd = persistente;
+    /// Configures whether `qemu-nbd` should run with the `--persistent` flag.
+    pub fn with_nbd_persistent(mut self, persistent: bool) -> Self {
+        self.nbd_persistent = persistent;
         self
     }
 
-    /// Asigna o reemplaza el token de cancelación atómico.
+    /// Assigns or replaces the atomic cancellation token.
     pub fn with_cancel_token(mut self, token: Arc<AtomicBool>) -> Self {
         self.cancel_token = Some(token);
         self
     }
 
-    /// Asigna o reemplaza el token de cancelación mediante [`CancellationToken`].
+    /// Assigns or replaces the cancellation token via [`CancellationToken`].
     pub fn with_cancellation_token(mut self, token: &CancellationToken) -> Self {
         self.cancel_token = Some(token.clone_arc());
         self
     }
 }
 
-/// Evento de progreso emitido periódicamente hacia consumidores externos (CLI o Tauri UI).
+/// Progress event emitted periodically to external consumers (CLI or Tauri UI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgresoInspeccion {
-    /// Porcentaje de avance global (de 0 a 100).
-    pub porcentaje: u8,
-    /// Nombre corto de la fase o tarea actual (ej. "Leyendo MBR/GPT...", "Analizando NTFS...").
-    pub etapa: String,
-    /// Información técnica adicional u opcional sobre el progreso.
-    pub detalle: Option<String>,
+pub struct InspectionProgressEvent {
+    /// Global completion percentage (0..=100).
+    pub percentage: u8,
+    /// Short name of the current phase or task (e.g. "Reading MBR/GPT...", "Analyzing NTFS...").
+    pub stage: String,
+    /// Optional additional technical information about the progress.
+    pub detail: Option<String>,
 }
 
-/// Resultado completo y consolidado de la inspección del disco virtual.
+/// Complete and consolidated inspection report of the virtual disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InformeInspeccion {
-    /// Información sobre el archivo de imagen inspeccionado.
-    pub imagen: InfoImagen,
-    /// Esquema de tabla de particiones hallado.
-    pub esquema: EsquemaParticion,
-    /// Lista de particiones identificadas.
-    pub particiones: Vec<Particion>,
-    /// Clasificación general del sistema operativo detectado.
-    pub sistema_operativo: SistemaOperativo,
-    /// Metadatos detallados del SO instalado.
-    pub vm_info: VMInfo,
-    /// Lista de programas estructurados hallados en el sistema (Nombre, Versión, Editor).
-    pub programas: Vec<Programa>,
-    /// Advertencias no fatales recopiladas durante la inspección (ej. Registro de
-    /// Windows dañado o "sucio" del que se degradó con gracia el análisis, sin
-    /// abortar el resto del pipeline).
+pub struct InspectionReport {
+    /// Information about the inspected image file.
+    pub image: ImageInfo,
+    /// Detected partition table scheme.
+    pub scheme: PartitionScheme,
+    /// List of identified partitions.
+    pub partitions: Vec<Partition>,
+    /// General classification of the detected operating system.
+    pub operating_system: OperatingSystem,
+    /// Detailed metadata of the installed OS.
+    pub guest_info: GuestInfo,
+    /// List of structured programs found on the system (Name, Version, Publisher).
+    pub installed_programs: Vec<Program>,
+    /// Non-fatal warnings collected during the inspection (e.g. a Windows
+    /// Registry that was dirty or damaged and from which we gracefully
+    /// degraded without aborting the rest of the pipeline).
     #[serde(default)]
-    pub advertencias: Vec<String>,
-    /// Métricas de rendimiento asociadas a la inspección.
-    pub estadisticas: Estadisticas,
+    pub warnings: Vec<String>,
+    /// Performance metrics associated with the inspection.
+    pub stats: Stats,
 }
 
 #[cfg(test)]
@@ -411,60 +374,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_opciones_defecto() {
-        let opc = Opciones::default();
-        assert!(!opc.noapps);
-        assert!(!opc.nosystem);
-        assert!(opc.debe_analizar_apps());
-        assert!(opc.debe_analizar_sistema());
+    fn test_options_defaults() {
+        let opts = Options::default();
+        assert!(!opts.no_apps);
+        assert!(!opts.no_system);
+        assert!(opts.should_analyze_apps());
+        assert!(opts.should_analyze_system());
     }
 
     #[test]
-    fn test_opciones_alias_ingles_should_analyze() {
-        let opc = Opciones {
-            noapps: true,
-            ..Opciones::default()
+    fn test_options_no_apps() {
+        let opts = Options {
+            no_apps: true,
+            ..Options::default()
         };
-        assert_eq!(opc.should_analyze_apps(), opc.debe_analizar_apps());
-        assert_eq!(opc.should_analyze_system(), opc.debe_analizar_sistema());
-        assert!(!opc.should_analyze_apps());
-        assert!(opc.should_analyze_system());
+        assert!(!opts.should_analyze_apps());
+        assert!(opts.should_analyze_system());
     }
 
     #[test]
-    fn test_opciones_noapps() {
-        let opc = Opciones {
-            noapps: true,
-            ..Opciones::default()
+    fn test_options_no_system() {
+        let opts = Options {
+            no_system: true,
+            ..Options::default()
         };
-        assert!(!opc.debe_analizar_apps());
-        assert!(opc.debe_analizar_sistema());
+        assert!(opts.should_analyze_apps());
+        assert!(!opts.should_analyze_system());
     }
 
     #[test]
-    fn test_opciones_nosystem() {
-        let opc = Opciones {
-            nosystem: true,
-            ..Opciones::default()
-        };
-        assert!(opc.debe_analizar_apps());
-        assert!(!opc.debe_analizar_sistema());
-    }
-
-    #[test]
-    fn test_opciones_nbd_avanzadas() {
-        let opc = Opciones::default()
-            .with_socket_unix("/tmp/qemu-test.sock")
+    fn test_options_nbd_advanced() {
+        let opts = Options::default()
+            .with_unix_socket("/tmp/qemu-test.sock")
             .with_extra_nbd_args(vec!["--cache=none".into(), "--detect-zeroes=on".into()])
             .with_connection_timeout(Duration::from_secs(10))
-            .with_persistente_nbd(true);
+            .with_nbd_persistent(true);
 
-        assert_eq!(opc.socket_unix, Some(PathBuf::from("/tmp/qemu-test.sock")));
+        assert_eq!(opts.unix_socket, Some(PathBuf::from("/tmp/qemu-test.sock")));
         assert_eq!(
-            opc.args_extra_nbd,
+            opts.extra_nbd_args,
             vec!["--cache=none".to_string(), "--detect-zeroes=on".to_string()]
         );
-        assert_eq!(opc.timeout_conexion, Some(Duration::from_secs(10)));
-        assert!(opc.persistente_nbd);
+        assert_eq!(opts.connection_timeout, Some(Duration::from_secs(10)));
+        assert!(opts.nbd_persistent);
     }
 }

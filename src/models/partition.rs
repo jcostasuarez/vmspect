@@ -1,21 +1,21 @@
-//! Modelos de particiones, esquemas y sistemas de archivos.
+//! Models for partitions, schemes and file systems.
 
 use serde::{Deserialize, Serialize};
 
-/// Esquema de la tabla de particiones presente en el disco virtual.
+/// Partition table scheme present in the virtual disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EsquemaParticion {
-    /// Master Boot Record tradicional.
+pub enum PartitionScheme {
+    /// Traditional Master Boot Record.
     Mbr,
     /// GUID Partition Table.
     Gpt,
-    /// El disco carece de tabla de particiones: el sistema de archivos inicia directamente en el sector 0.
-    SinTabla,
+    /// The disk lacks a partition table: the file system starts directly at sector 0.
+    None,
 }
 
-/// Tipo de sistema de archivos identificado en una partición.
+/// Type of file system identified in a partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SistemaArchivos {
+pub enum FileSystem {
     /// New Technology File System (Windows).
     Ntfs,
     /// File Allocation Table (FAT12/FAT16/FAT32/exFAT).
@@ -30,89 +30,89 @@ pub enum SistemaArchivos {
     Xfs,
     /// B-tree file system (Linux).
     Btrfs,
-    /// Partición de intercambio de Linux.
+    /// Linux swap partition.
     LinuxSwap,
-    /// Volumen Físico de LVM2 (Linux Logical Volume Manager).
+    /// LVM2 Physical Volume (Linux Logical Volume Manager).
     Lvm2,
-    /// Sistema de archivos no reconocido o no soportado.
-    Desconocido,
+    /// Unrecognized or unsupported file system.
+    Unknown,
 }
 
-impl SistemaArchivos {
-    /// Determina si el sistema de archivos pertenece nativamente al ecosistema Linux.
-    pub fn es_linux(&self) -> bool {
+impl FileSystem {
+    /// Returns whether the file system natively belongs to the Linux ecosystem.
+    pub fn is_linux(&self) -> bool {
         matches!(
             self,
-            SistemaArchivos::Ext2
-                | SistemaArchivos::Ext3
-                | SistemaArchivos::Ext4
-                | SistemaArchivos::Xfs
-                | SistemaArchivos::Btrfs
-                | SistemaArchivos::LinuxSwap
-                | SistemaArchivos::Lvm2
+            FileSystem::Ext2
+                | FileSystem::Ext3
+                | FileSystem::Ext4
+                | FileSystem::Xfs
+                | FileSystem::Btrfs
+                | FileSystem::LinuxSwap
+                | FileSystem::Lvm2
         )
     }
 
-    /// Nombre amigable y estandarizado del sistema de archivos.
-    pub fn nombre(&self) -> &'static str {
+    /// Friendly, standardized name of the file system.
+    pub fn name(&self) -> &'static str {
         match self {
-            SistemaArchivos::Ntfs => "NTFS",
-            SistemaArchivos::Fat => "FAT",
-            SistemaArchivos::Ext2 => "ext2",
-            SistemaArchivos::Ext3 => "ext3",
-            SistemaArchivos::Ext4 => "ext4",
-            SistemaArchivos::Xfs => "XFS",
-            SistemaArchivos::Btrfs => "Btrfs",
-            SistemaArchivos::LinuxSwap => "Linux swap",
-            SistemaArchivos::Lvm2 => "LVM2 PV",
-            SistemaArchivos::Desconocido => "desconocido",
+            FileSystem::Ntfs => "NTFS",
+            FileSystem::Fat => "FAT",
+            FileSystem::Ext2 => "ext2",
+            FileSystem::Ext3 => "ext3",
+            FileSystem::Ext4 => "ext4",
+            FileSystem::Xfs => "XFS",
+            FileSystem::Btrfs => "Btrfs",
+            FileSystem::LinuxSwap => "Linux swap",
+            FileSystem::Lvm2 => "LVM2 PV",
+            FileSystem::Unknown => "unknown",
         }
     }
 }
 
-/// Clasificación general de la familia del sistema operativo invitado.
+/// General classification of the guest operating system family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SistemaOperativo {
-    /// Sistemas operativos Microsoft Windows.
+pub enum OperatingSystem {
+    /// Microsoft Windows operating systems.
     Windows,
-    /// Distribuciones Linux.
+    /// Linux distributions.
     Linux,
-    /// Sistema operativo no identificado o no soportado.
-    Desconocido,
+    /// Unidentified or unsupported operating system.
+    Unknown,
 }
 
-impl SistemaOperativo {
-    /// Devuelve un emoji representativo del sistema operativo para interfaces de consola.
-    pub fn icono(&self) -> &'static str {
+impl OperatingSystem {
+    /// Returns a representative emoji for the operating system, for console UIs.
+    pub fn icon(&self) -> &'static str {
         match self {
-            SistemaOperativo::Windows => "🪟",
-            SistemaOperativo::Linux => "🐧",
-            SistemaOperativo::Desconocido => "❓",
+            OperatingSystem::Windows => "🪟",
+            OperatingSystem::Linux => "🐧",
+            OperatingSystem::Unknown => "❓",
         }
     }
 }
 
-/// Representación de una partición física localizada dentro del disco virtual.
+/// Representation of a physical partition located inside the virtual disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Particion {
-    /// Índice secuencial de la partición dentro de la tabla.
-    pub indice: usize,
-    /// Desplazamiento absoluto en bytes donde inicia la partición en el disco virtual.
-    pub inicio: u64,
-    /// Tamaño total de la partición expresado en bytes.
-    pub tamano: u64,
-    /// Tipo de partición declarado (byte MBR o GUID GPT traducido).
-    pub tipo: String,
-    /// Sistema de archivos detectado inspeccionando la firma del primer sector de la partición.
-    pub sistema_archivos: SistemaArchivos,
-    /// Etiqueta o volumen opcional asignado a la partición.
-    pub etiqueta: Option<String>,
+pub struct Partition {
+    /// Sequential index of the partition within the table.
+    pub index: usize,
+    /// Absolute offset in bytes where the partition starts on the virtual disk.
+    pub start: u64,
+    /// Total size of the partition expressed in bytes.
+    pub size: u64,
+    /// Declared partition type (MBR byte or translated GPT GUID).
+    pub kind: String,
+    /// File system detected by inspecting the signature of the first sector of the partition.
+    pub file_system: FileSystem,
+    /// Optional label or volume name assigned to the partition.
+    pub label: Option<String>,
 }
 
-impl Particion {
-    /// Devuelve `true` si el sistema de archivos de la partición es NTFS.
-    pub fn es_ntfs(&self) -> bool {
-        matches!(self.sistema_archivos, SistemaArchivos::Ntfs)
+impl Partition {
+    /// Returns `true` if the partition's file system is NTFS.
+    pub fn is_ntfs(&self) -> bool {
+        matches!(self.file_system, FileSystem::Ntfs)
     }
 }
 
@@ -121,9 +121,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sistema_archivos() {
-        assert!(SistemaArchivos::Ext4.es_linux());
-        assert!(!SistemaArchivos::Ntfs.es_linux());
-        assert_eq!(SistemaArchivos::Ntfs.nombre(), "NTFS");
+    fn test_file_system() {
+        assert!(FileSystem::Ext4.is_linux());
+        assert!(!FileSystem::Ntfs.is_linux());
+        assert_eq!(FileSystem::Ntfs.name(), "NTFS");
     }
 }

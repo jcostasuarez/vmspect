@@ -1,7 +1,8 @@
-//! # CLI de vmspect
+//! # vmspect CLI
 //!
-//! Punto de entrada de línea de comandos para la inspección y análisis estático de imágenes de disco virtual.
-//! Permite analizar imágenes individuales o escanear directorios completos en modo secuencial o concurrente.
+//! Command-line entry point for the static inspection and analysis of virtual disk images.
+//! Supports analyzing individual images or scanning entire directories sequentially or
+//! concurrently.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -12,133 +13,133 @@ use vmspect::prelude::*;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Configuración parseada desde la línea de comandos.
+/// Configuration parsed from the command line.
 #[derive(Debug, Default)]
-struct ConfigCli {
-    /// Ruta obligatoria al archivo de imagen o directorio objetivo.
-    ruta_objetivo: Option<PathBuf>,
-    /// Imprime la salida formateada en JSON estructurado.
-    formato_json: bool,
-    /// Ejecuta el análisis en paralelo mediante [`ProcesadorConcurrente`].
-    concurrente: bool,
-    /// Fuerza el uso de `qemu-nbd` incluso para formatos nativos.
-    forzar_nbd: bool,
-    /// Búsqueda recursiva en subdirectorios cuando el objetivo es un directorio.
-    recursivo: bool,
-    /// Desactiva la recolección de aplicaciones instaladas.
-    noapps: bool,
-    /// Desactiva la recolección de metadatos del sistema operativo.
-    nosystem: bool,
-    /// Fuerza la lectura de la colmena `SYSTEM` en Windows.
-    incluir_system: bool,
-    /// Cantidad máxima de hilos workers para el modo concurrente.
+struct CliConfig {
+    /// Mandatory path to the target image file or directory.
+    target_path: Option<PathBuf>,
+    /// Prints structured JSON-formatted output.
+    json_format: bool,
+    /// Runs the analysis in parallel via [`ConcurrentProcessor`].
+    concurrent: bool,
+    /// Forces the `qemu-nbd` backend even for natively-readable formats.
+    force_nbd: bool,
+    /// Recursive search when the target is a directory.
+    recursive: bool,
+    /// Disables collection of installed applications.
+    no_apps: bool,
+    /// Disables collection of guest-OS metadata.
+    no_system: bool,
+    /// Forces reading of the `SYSTEM` hive on Windows.
+    include_system: bool,
+    /// Maximum number of worker threads in concurrent mode.
     max_workers: Option<usize>,
 }
 
-fn imprimir_ayuda() {
+fn print_help() {
     println!(
-        r#"vmspect {VERSION} - Inspección estática y análisis forense de imágenes de disco virtual
+        r#"vmspect {VERSION} - Static inspection and forensic analysis of virtual disk images
 
-USO:
-    vmspect [OPCIONES] <RUTA>
+USAGE:
+    vmspect [OPTIONS] <PATH>
 
-ARGUMENTOS:
-    <RUTA>                     Ruta a un archivo de disco virtual (.vmdk, .raw, .qcow2, .vhdx, .vdi, etc.)
-                               o a un directorio que contenga imágenes de máquinas virtuales.
+ARGUMENTS:
+    <PATH>                     Path to a virtual disk file (.vmdk, .raw, .qcow2, .vhdx, .vdi, etc.)
+                               or to a directory containing VM disk images.
 
-OPCIONES:
-    --json                     Imprime los resultados en formato JSON estructurado a través de stdout.
-    --concurrente              Habilita el procesamiento concurrente de imágenes mediante ProcesadorConcurrente.
-    --forzar-nbd               Fuerza el backend qemu-nbd para todos los formatos de disco.
-    -r, --recursivo            Busca imágenes recursivamente al escanear un directorio.
-    --noapps                   Omite la extracción del catálogo de software instalado.
-    --nosystem                 Omite la extracción de información y metadatos del SO invitado.
-    --incluir-system           Extrae también la colmena SYSTEM del Registro en imágenes Windows.
-    -w, --workers <NUM>        Número máximo de hilos concurrentes (por defecto: núcleos lógicos del sistema).
-    -h, --help                 Muestra esta información de ayuda.
-    -V, --version              Muestra la versión actual de la herramienta.
+OPTIONS:
+    --json                     Prints structured JSON output to stdout.
+    --concurrent               Enables concurrent image processing via ConcurrentProcessor.
+    --force-nbd                Forces the qemu-nbd backend for every disk format.
+    -r, --recursive            Searches images recursively when scanning a directory.
+    --no-apps                  Skips extraction of the installed-software catalog.
+    --no-system                Skips extraction of guest-OS information and metadata.
+    --include-system           Also extracts the SYSTEM hive from the Registry on Windows images.
+    -w, --workers <NUM>        Maximum number of concurrent threads (default: logical CPU cores).
+    -h, --help                 Shows this help information.
+    -V, --version              Shows the current tool version.
 
-EJEMPLOS:
-    vmspect disco.vmdk
-    vmspect disco.qcow2 --json
-    vmspect /var/lib/libvirt/images/ --concurrente --recursivo
-    vmspect C:\VMs\Windows10.vmdk --forzar-nbd
+EXAMPLES:
+    vmspect disk.vmdk
+    vmspect disk.qcow2 --json
+    vmspect /var/lib/libvirt/images/ --concurrent --recursive
+    vmspect C:\VMs\Windows10.vmdk --force-nbd
 "#
     );
 }
 
-fn imprimir_version() {
+fn print_version() {
     println!("vmspect {}", VERSION);
 }
 
-fn parsear_argumentos() -> std::result::Result<ConfigCli, String> {
-    parsear_argumentos_desde(env::args().skip(1))
+fn parse_args() -> std::result::Result<CliConfig, String> {
+    parse_args_from(env::args().skip(1))
 }
 
-fn parsear_argumentos_desde<I>(mut args: I) -> std::result::Result<ConfigCli, String>
+fn parse_args_from<I>(mut args: I) -> std::result::Result<CliConfig, String>
 where
     I: Iterator<Item = String>,
 {
-    let mut config = ConfigCli::default();
+    let mut config = CliConfig::default();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                imprimir_ayuda();
+                print_help();
                 process::exit(0);
             }
             "-V" | "--version" => {
-                imprimir_version();
+                print_version();
                 process::exit(0);
             }
             "--json" => {
-                config.formato_json = true;
+                config.json_format = true;
             }
-            "--concurrente" => {
-                config.concurrente = true;
+            "--concurrent" => {
+                config.concurrent = true;
             }
-            "--forzar-nbd" => {
-                config.forzar_nbd = true;
+            "--force-nbd" => {
+                config.force_nbd = true;
             }
-            "-r" | "--recursivo" => {
-                config.recursivo = true;
+            "-r" | "--recursive" => {
+                config.recursive = true;
             }
-            "--noapps" => {
-                config.noapps = true;
+            "--no-apps" => {
+                config.no_apps = true;
             }
-            "--nosystem" => {
-                config.nosystem = true;
+            "--no-system" => {
+                config.no_system = true;
             }
-            "--incluir-system" => {
-                config.incluir_system = true;
+            "--include-system" => {
+                config.include_system = true;
             }
             "-w" | "--workers" => {
-                let valor = args
+                let value = args
                     .next()
-                    .ok_or_else(|| "Se requiere un valor numérico para --workers".to_string())?;
-                let num = valor
+                    .ok_or_else(|| "A numeric value is required for --workers".to_string())?;
+                let num = value
                     .parse::<usize>()
-                    .map_err(|_| format!("Número de workers inválido: '{}'", valor))?;
+                    .map_err(|_| format!("Invalid worker count: '{}'", value))?;
                 config.max_workers = Some(num);
             }
-            otro if otro.starts_with("--workers=") => {
-                let valor = otro.trim_start_matches("--workers=");
-                let num = valor
+            other if other.starts_with("--workers=") => {
+                let value = other.trim_start_matches("--workers=");
+                let num = value
                     .parse::<usize>()
-                    .map_err(|_| format!("Número de workers inválido: '{}'", valor))?;
+                    .map_err(|_| format!("Invalid worker count: '{}'", value))?;
                 config.max_workers = Some(num);
             }
-            otro if otro.starts_with('-') => {
+            other if other.starts_with('-') => {
                 return Err(format!(
-                    "Opción desconocida: '{}'. Usa --help para ver las opciones disponibles.",
-                    otro
+                    "Unknown option: '{}'. Use --help to see the available options.",
+                    other
                 ));
             }
-            posicional => {
-                if config.ruta_objetivo.is_none() {
-                    config.ruta_objetivo = Some(PathBuf::from(posicional));
+            positional => {
+                if config.target_path.is_none() {
+                    config.target_path = Some(PathBuf::from(positional));
                 } else {
-                    return Err(format!("Argumento posicional inesperado: '{}'", posicional));
+                    return Err(format!("Unexpected positional argument: '{}'", positional));
                 }
             }
         }
@@ -148,128 +149,123 @@ where
 }
 
 fn main() {
-    let config = match parsear_argumentos() {
+    let config = match parse_args() {
         Ok(c) => c,
         Err(err) => {
-            eprintln!("Error de argumentos: {}", err);
-            eprintln!("Ejecute 'vmspect --help' para consultar el uso correcto.");
+            eprintln!("Argument error: {}", err);
+            eprintln!("Run 'vmspect --help' for the correct usage.");
             process::exit(1);
         }
     };
 
-    let ruta = match config.ruta_objetivo {
+    let path = match config.target_path {
         Some(ref p) => p,
         None => {
-            eprintln!("Error: Se requiere especificar la ruta a una imagen de disco o directorio.");
-            eprintln!("Uso: vmspect [OPCIONES] <RUTA>");
-            eprintln!("Ejecute 'vmspect --help' para más información.");
+            eprintln!("Error: a path to a disk image or directory is required.");
+            eprintln!("Usage: vmspect [OPTIONS] <PATH>");
+            eprintln!("Run 'vmspect --help' for more information.");
             process::exit(1);
         }
     };
 
-    if !ruta.exists() {
-        eprintln!("Error: La ruta especificada no existe: {}", ruta.display());
+    if !path.exists() {
+        eprintln!(
+            "Error: the supplied path does not exist: {}",
+            path.display()
+        );
         process::exit(1);
     }
 
-    let opciones = Opciones {
-        forzar_nbd: config.forzar_nbd,
-        noapps: config.noapps,
-        nosystem: config.nosystem,
-        incluir_system: config.incluir_system,
+    let options = Options {
+        force_nbd: config.force_nbd,
+        no_apps: config.no_apps,
+        no_system: config.no_system,
+        include_system: config.include_system,
         ..Default::default()
     };
 
-    if ruta.is_file() {
-        ejecutar_archivo(ruta, &opciones, config.formato_json);
-    } else if ruta.is_dir() {
-        ejecutar_directorio(ruta, &config, &opciones);
+    if path.is_file() {
+        run_file(path, &options, config.json_format);
+    } else if path.is_dir() {
+        run_directory(path, &config, &options);
     } else {
         eprintln!(
-            "Error: La ruta especificada no es un archivo ni un directorio válido: {}",
-            ruta.display()
+            "Error: the supplied path is neither a file nor a valid directory: {}",
+            path.display()
         );
         process::exit(1);
     }
 }
 
-fn ejecutar_archivo(ruta: &Path, opciones: &Opciones, formato_json: bool) {
-    if es_extent_secundario(ruta) && !formato_json {
+fn run_file(path: &Path, options: &Options, json_format: bool) {
+    if is_secondary_extent(path) && !json_format {
         eprintln!(
-            "Nota: '{}' parece ser un fragmento secundario (extent). Si el análisis falla, intente apuntar al descriptor principal .vmdk.",
-            ruta.display()
+            "Note: '{}' looks like a secondary extent fragment. If analysis fails, point at the main .vmdk descriptor instead.",
+            path.display()
         );
     }
 
-    if formato_json {
-        let motor = MotorInspeccion::new(opciones.clone());
-        match motor.inspeccionar(ruta) {
-            Ok(informe) => match serde_json::to_string_pretty(&informe) {
+    if json_format {
+        let engine = InspectionEngine::new(options.clone());
+        match engine.inspect(path) {
+            Ok(report) => match serde_json::to_string_pretty(&report) {
                 Ok(json) => println!("{}", json),
                 Err(e) => {
-                    eprintln!("Error al serializar JSON: {}", e);
+                    eprintln!("Error serializing JSON: {}", e);
                     process::exit(1);
                 }
             },
             Err(e) => {
-                eprintln!("Error de inspección en '{}': {}", ruta.display(), e);
+                eprintln!("Inspection error on '{}': {}", path.display(), e);
                 process::exit(1);
             }
         }
     } else {
         println!("============================================================");
-        println!("  Iniciando inspección de: {}", ruta.display());
+        println!("  Starting inspection of: {}", path.display());
         println!("============================================================");
 
-        let inicio = Instant::now();
-        let resultado = inspeccionar_con_progreso(ruta, opciones, |progreso| {
-            let detalle_str = progreso.detalle.as_deref().unwrap_or("");
-            if !detalle_str.is_empty() {
+        let start = Instant::now();
+        let result = inspect_with_progress(path, options, |progress| {
+            let detail_str = progress.detail.as_deref().unwrap_or("");
+            if !detail_str.is_empty() {
                 eprintln!(
                     "[{:>3}%] {} ({})",
-                    progreso.porcentaje, progreso.etapa, detalle_str
+                    progress.percentage, progress.stage, detail_str
                 );
             } else {
-                eprintln!("[{:>3}%] {}", progreso.porcentaje, progreso.etapa);
+                eprintln!("[{:>3}%] {}", progress.percentage, progress.stage);
             }
         });
 
-        match resultado {
-            Ok(informe) => {
-                imprimir_informe_humano(&informe, inicio.elapsed().as_millis() as u64);
+        match result {
+            Ok(report) => {
+                print_human_report(&report, start.elapsed().as_millis() as u64);
             }
             Err(e) => {
-                eprintln!(
-                    "\nError al inspeccionar la imagen '{}': {}",
-                    ruta.display(),
-                    e
-                );
+                eprintln!("\nError inspecting image '{}': {}", path.display(), e);
                 process::exit(1);
             }
         }
     }
 }
 
-fn ejecutar_directorio(directorio: &Path, config: &ConfigCli, opciones: &Opciones) {
-    let imagenes = match listar_vms(directorio, config.recursivo) {
+fn run_directory(directory: &Path, config: &CliConfig, options: &Options) {
+    let images = match list_vms(directory, config.recursive) {
         Ok(imgs) => imgs,
         Err(e) => {
-            eprintln!(
-                "Error al listar imágenes en '{}': {}",
-                directorio.display(),
-                e
-            );
+            eprintln!("Error listing images in '{}': {}", directory.display(), e);
             process::exit(1);
         }
     };
 
-    if imagenes.is_empty() {
-        if config.formato_json {
+    if images.is_empty() {
+        if config.json_format {
             println!("[]");
         } else {
             println!(
-                "No se encontraron imágenes de disco virtual en '{}'.",
-                directorio.display()
+                "No virtual disk images were found in '{}'.",
+                directory.display()
             );
         }
         return;
@@ -281,229 +277,222 @@ fn ejecutar_directorio(directorio: &Path, config: &ConfigCli, opciones: &Opcione
             .unwrap_or(4)
     });
 
-    if config.concurrente {
-        if !config.formato_json {
+    if config.concurrent {
+        if !config.json_format {
             println!("============================================================");
-            println!(
-                "  Escaneo Concurrente: {} imágenes encontradas",
-                imagenes.len()
-            );
-            println!("  Directorio: {}", directorio.display());
-            println!("  Hilos de trabajo (Workers): {}", max_workers);
+            println!("  Concurrent Scan: {} images found", images.len());
+            println!("  Directory: {}", directory.display());
+            println!("  Worker threads: {}", max_workers);
             println!("============================================================\n");
         }
 
-        let inicio = Instant::now();
-        let resultado =
-            ProcesadorConcurrente::inspeccionar_imagenes(imagenes, opciones, max_workers);
+        let start = Instant::now();
+        let result = ConcurrentProcessor::inspect_images(images, options, max_workers);
 
-        match resultado {
-            Ok(informes) => {
-                if config.formato_json {
-                    match serde_json::to_string_pretty(&informes) {
+        match result {
+            Ok(reports) => {
+                if config.json_format {
+                    match serde_json::to_string_pretty(&reports) {
                         Ok(json) => println!("{}", json),
                         Err(e) => {
-                            eprintln!("Error al serializar JSON: {}", e);
+                            eprintln!("Error serializing JSON: {}", e);
                             process::exit(1);
                         }
                     }
                 } else {
-                    for (i, informe) in informes.iter().enumerate() {
+                    for (i, report) in reports.iter().enumerate() {
                         println!(
-                            "\n--- [Imagen {}/{}] ----------------------------------------",
+                            "\n--- [Image {}/{}] ----------------------------------------",
                             i + 1,
-                            informes.len()
+                            reports.len()
                         );
-                        imprimir_informe_humano(informe, informe.estadisticas.duracion_ms);
+                        print_human_report(report, report.stats.duration_ms);
                     }
 
-                    let duracion_total = inicio.elapsed().as_millis() as u64;
+                    let total_duration = start.elapsed().as_millis() as u64;
                     println!("\n============================================================");
-                    println!("  Resumen Lote Concurrente:");
-                    println!("  Total imágenes procesadas: {}", informes.len());
+                    println!("  Concurrent Batch Summary:");
+                    println!("  Total images processed: {}", reports.len());
                     println!(
-                        "  Tiempo total transcurrido: {} ms ({:.2} s)",
-                        duracion_total,
-                        duracion_total as f64 / 1000.0
+                        "  Total elapsed time: {} ms ({:.2} s)",
+                        total_duration,
+                        total_duration as f64 / 1000.0
                     );
                     println!("============================================================");
                 }
             }
             Err(e) => {
-                eprintln!("Error durante el procesamiento concurrente: {}", e);
+                eprintln!("Error during concurrent processing: {}", e);
                 process::exit(1);
             }
         }
     } else {
-        // Modo secuencial para el directorio
-        if !config.formato_json {
+        // Sequential mode for the directory
+        if !config.json_format {
             println!("============================================================");
-            println!(
-                "  Escaneo Secuencial: {} imágenes encontradas",
-                imagenes.len()
-            );
-            println!("  Directorio: {}", directorio.display());
+            println!("  Sequential Scan: {} images found", images.len());
+            println!("  Directory: {}", directory.display());
             println!("============================================================\n");
         }
 
-        let inicio = Instant::now();
-        let mut informes = Vec::with_capacity(imagenes.len());
+        let start = Instant::now();
+        let mut reports = Vec::with_capacity(images.len());
 
-        for (i, ruta_img) in imagenes.iter().enumerate() {
-            if !config.formato_json {
+        for (i, image_path) in images.iter().enumerate() {
+            if !config.json_format {
                 println!(
-                    "[{}/{}] Inspeccionando '{}'...",
+                    "[{}/{}] Inspecting '{}'...",
                     i + 1,
-                    imagenes.len(),
-                    ruta_img.display()
+                    images.len(),
+                    image_path.display()
                 );
             }
 
-            let motor = MotorInspeccion::new(opciones.clone());
-            match motor.inspeccionar(ruta_img) {
-                Ok(informe) => {
-                    if !config.formato_json {
-                        imprimir_informe_humano(&informe, informe.estadisticas.duracion_ms);
+            let engine = InspectionEngine::new(options.clone());
+            match engine.inspect(image_path) {
+                Ok(report) => {
+                    if !config.json_format {
+                        print_human_report(&report, report.stats.duration_ms);
                         println!();
                     }
-                    informes.push(informe);
+                    reports.push(report);
                 }
                 Err(e) => {
                     eprintln!(
-                        "Advertencia: Falló el análisis de '{}': {}",
-                        ruta_img.display(),
+                        "Warning: analysis of '{}' failed: {}",
+                        image_path.display(),
                         e
                     );
                 }
             }
         }
 
-        if config.formato_json {
-            match serde_json::to_string_pretty(&informes) {
+        if config.json_format {
+            match serde_json::to_string_pretty(&reports) {
                 Ok(json) => println!("{}", json),
                 Err(e) => {
-                    eprintln!("Error al serializar JSON: {}", e);
+                    eprintln!("Error serializing JSON: {}", e);
                     process::exit(1);
                 }
             }
         } else {
-            let duracion_total = inicio.elapsed().as_millis() as u64;
+            let total_duration = start.elapsed().as_millis() as u64;
             println!("============================================================");
-            println!("  Resumen Escaneo Secuencial:");
+            println!("  Sequential Scan Summary:");
             println!(
-                "  Imágenes completadas con éxito: {}/{}",
-                informes.len(),
-                imagenes.len()
+                "  Successfully completed images: {}/{}",
+                reports.len(),
+                images.len()
             );
             println!(
-                "  Tiempo total: {} ms ({:.2} s)",
-                duracion_total,
-                duracion_total as f64 / 1000.0
+                "  Total time: {} ms ({:.2} s)",
+                total_duration,
+                total_duration as f64 / 1000.0
             );
             println!("============================================================");
         }
     }
 }
 
-fn imprimir_informe_humano(informe: &InformeInspeccion, duracion_ms: u64) {
-    let img = &informe.imagen;
-    let so = &informe.sistema_operativo;
-    let info = &informe.vm_info;
+fn print_human_report(report: &InspectionReport, duration_ms: u64) {
+    let img = &report.image;
+    let os = &report.operating_system;
+    let info = &report.guest_info;
 
-    println!("\n[+] INFORMACIÓN DE LA IMAGEN");
-    println!("    Archivo:         {}", img.ruta.display());
-    println!("    Formato:         {}", img.formato.to_uppercase());
-    println!("    Hipervisor:      {}", img.hipervisor.nombre());
+    println!("\n[+] IMAGE INFO");
+    println!("    File:            {}", img.path.display());
+    println!("    Format:          {}", img.format.to_uppercase());
+    println!("    Hypervisor:      {}", img.hypervisor.name());
     println!(
-        "    Tamaño Virtual:  {} ({} bytes)",
-        formatear_bytes(img.tamano_virtual),
-        img.tamano_virtual
+        "    Virtual Size:    {} ({} bytes)",
+        format_bytes(img.virtual_size),
+        img.virtual_size
     );
     println!(
-        "    Tamaño en Disco: {} ({} bytes)",
-        formatear_bytes(img.tamano_real),
-        img.tamano_real
+        "    On-disk Size:    {} ({} bytes)",
+        format_bytes(img.actual_size),
+        img.actual_size
     );
 
-    println!("\n[+] PARTICIONES ({:?})", informe.esquema);
-    if informe.particiones.is_empty() {
-        println!("    (No se identificaron particiones reconocibles)");
+    println!("\n[+] PARTITIONS ({:?})", report.scheme);
+    if report.partitions.is_empty() {
+        println!("    (No recognizable partitions were identified)");
     } else {
-        for p in &informe.particiones {
-            let etiqueta = p
-                .etiqueta
+        for p in &report.partitions {
+            let label = p
+                .label
                 .as_deref()
-                .map(|e| format!(" [Etiqueta: {}]", e))
+                .map(|l| format!(" [Label: {}]", l))
                 .unwrap_or_default();
             println!(
-                "    #{} - FS: {:<10} Tamaño: {:<10} Offset: {:<12} Tipo: {}{}",
-                p.indice,
-                p.sistema_archivos.nombre(),
-                formatear_bytes(p.tamano),
-                p.inicio,
-                p.tipo,
-                etiqueta
+                "    #{} - FS: {:<10} Size: {:<10} Offset: {:<12} Type: {}{}",
+                p.index,
+                p.file_system.name(),
+                format_bytes(p.size),
+                p.start,
+                p.kind,
+                label
             );
         }
     }
 
-    println!("\n[+] SISTEMA OPERATIVO {}", so.icono());
-    println!("    Familia:         {:?}", so);
-    if !info.os_nombre.is_empty() {
-        println!("    Nombre / Versión: {}", info.os_cadena_formateada());
+    println!("\n[+] OPERATING SYSTEM {}", os.icon());
+    println!("    Family:          {:?}", os);
+    if !info.os_name.is_empty() {
+        println!("    Name / Version:  {}", info.formatted_os_string());
     } else {
-        println!("    Nombre / Versión: No detectado o no disponible");
+        println!("    Name / Version:  Not detected or unavailable");
     }
     if let Some(ref tools) = info.guest_tools {
-        if tools.presente {
+        if tools.present {
             if let Some(ref ver) = tools.version {
-                println!("    Guest Tools:     {} {}", tools.tipo, ver);
+                println!("    Guest Tools:     {} {}", tools.kind, ver);
             } else {
-                println!("    Guest Tools:     {}", tools.tipo);
+                println!("    Guest Tools:     {}", tools.kind);
             }
         }
     }
 
-    if !informe.advertencias.is_empty() {
-        println!("\n[!] ADVERTENCIAS ({})", informe.advertencias.len());
-        for adv in &informe.advertencias {
-            println!("    - {}", adv);
+    if !report.warnings.is_empty() {
+        println!("\n[!] WARNINGS ({})", report.warnings.len());
+        for warning in &report.warnings {
+            println!("    - {}", warning);
         }
     }
 
-    println!("\n[+] SOFTWARE INSTALADO ({})", informe.programas.len());
-    if informe.programas.is_empty() {
-        println!("    (Sin aplicaciones detectadas o extracción deshabilitada)");
+    println!(
+        "\n[+] INSTALLED SOFTWARE ({})",
+        report.installed_programs.len()
+    );
+    if report.installed_programs.is_empty() {
+        println!("    (No applications detected or extraction disabled)");
     } else {
-        for (idx, prog) in informe.programas.iter().enumerate() {
+        for (idx, prog) in report.installed_programs.iter().enumerate() {
             let ver = prog.version.as_deref().unwrap_or("-");
-            let editor = prog.editor.as_deref().unwrap_or("-");
+            let publisher = prog.publisher.as_deref().unwrap_or("-");
             println!(
-                "    {:>4}. {:<45} | Versión: {:<20} | Editor: {}",
+                "    {:>4}. {:<45} | Version: {:<20} | Publisher: {}",
                 idx + 1,
-                prog.nombre,
+                prog.name,
                 ver,
-                editor
+                publisher
             );
         }
     }
 
-    println!("\n[+] ESTADÍSTICAS Y RENDIMIENTO");
-    println!("    Modo de Acceso:  {}", informe.estadisticas.modo_acceso);
+    println!("\n[+] STATISTICS");
+    println!("    Access Mode:     {}", report.stats.access_mode);
     println!(
-        "    Bytes Leídos:    {}",
-        formatear_bytes(informe.estadisticas.bytes_leidos)
+        "    Bytes Read:      {}",
+        format_bytes(report.stats.bytes_read)
     );
-    if informe.estadisticas.peticiones_nbd > 0 {
-        println!(
-            "    Peticiones NBD:  {}",
-            informe.estadisticas.peticiones_nbd
-        );
+    if report.stats.nbd_requests > 0 {
+        println!("    NBD Requests:    {}", report.stats.nbd_requests);
     }
     println!(
-        "    Duración:        {} ms ({:.2} s)",
-        duracion_ms,
-        duracion_ms as f64 / 1000.0
+        "    Duration:        {} ms ({:.2} s)",
+        duration_ms,
+        duration_ms as f64 / 1000.0
     );
 }
 
@@ -512,60 +501,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parsear_argumentos_basico() {
-        let args = vec!["imagen.vmdk".to_string()];
-        let cfg = parsear_argumentos_desde(args.into_iter()).unwrap();
-        assert_eq!(cfg.ruta_objetivo, Some(PathBuf::from("imagen.vmdk")));
-        assert!(!cfg.formato_json);
-        assert!(!cfg.concurrente);
-        assert!(!cfg.forzar_nbd);
+    fn test_parse_args_basic() {
+        let args = vec!["image.vmdk".to_string()];
+        let cfg = parse_args_from(args.into_iter()).unwrap();
+        assert_eq!(cfg.target_path, Some(PathBuf::from("image.vmdk")));
+        assert!(!cfg.json_format);
+        assert!(!cfg.concurrent);
+        assert!(!cfg.force_nbd);
     }
 
     #[test]
-    fn test_parsear_banderas_opcionales() {
+    fn test_parse_optional_flags() {
         let args = vec![
             "--json".to_string(),
-            "--concurrente".to_string(),
-            "--forzar-nbd".to_string(),
-            "--recursivo".to_string(),
-            "--noapps".to_string(),
-            "--nosystem".to_string(),
-            "--incluir-system".to_string(),
+            "--concurrent".to_string(),
+            "--force-nbd".to_string(),
+            "--recursive".to_string(),
+            "--no-apps".to_string(),
+            "--no-system".to_string(),
+            "--include-system".to_string(),
             "--workers".to_string(),
             "8".to_string(),
-            "/ruta/vms".to_string(),
+            "/path/vms".to_string(),
         ];
-        let cfg = parsear_argumentos_desde(args.into_iter()).unwrap();
-        assert_eq!(cfg.ruta_objetivo, Some(PathBuf::from("/ruta/vms")));
-        assert!(cfg.formato_json);
-        assert!(cfg.concurrente);
-        assert!(cfg.forzar_nbd);
-        assert!(cfg.recursivo);
-        assert!(cfg.noapps);
-        assert!(cfg.nosystem);
-        assert!(cfg.incluir_system);
+        let cfg = parse_args_from(args.into_iter()).unwrap();
+        assert_eq!(cfg.target_path, Some(PathBuf::from("/path/vms")));
+        assert!(cfg.json_format);
+        assert!(cfg.concurrent);
+        assert!(cfg.force_nbd);
+        assert!(cfg.recursive);
+        assert!(cfg.no_apps);
+        assert!(cfg.no_system);
+        assert!(cfg.include_system);
         assert_eq!(cfg.max_workers, Some(8));
     }
 
     #[test]
-    fn test_parsear_workers_formato_igual() {
-        let args = vec!["--workers=12".to_string(), "disco.qcow2".to_string()];
-        let cfg = parsear_argumentos_desde(args.into_iter()).unwrap();
+    fn test_parse_workers_equals_format() {
+        let args = vec!["--workers=12".to_string(), "disk.qcow2".to_string()];
+        let cfg = parse_args_from(args.into_iter()).unwrap();
         assert_eq!(cfg.max_workers, Some(12));
-        assert_eq!(cfg.ruta_objetivo, Some(PathBuf::from("disco.qcow2")));
+        assert_eq!(cfg.target_path, Some(PathBuf::from("disk.qcow2")));
     }
 
     #[test]
-    fn test_parsear_opcion_desconocida_error() {
-        let args = vec!["--opcion-inexistente".to_string(), "disco.raw".to_string()];
-        let err = parsear_argumentos_desde(args.into_iter()).unwrap_err();
-        assert!(err.contains("Opción desconocida"));
+    fn test_parse_unknown_option_error() {
+        let args = vec!["--unknown-option".to_string(), "disk.raw".to_string()];
+        let err = parse_args_from(args.into_iter()).unwrap_err();
+        assert!(err.contains("Unknown option"));
     }
 
     #[test]
-    fn test_parsear_multiples_posicionales_error() {
-        let args = vec!["disco1.vmdk".to_string(), "disco2.vmdk".to_string()];
-        let err = parsear_argumentos_desde(args.into_iter()).unwrap_err();
-        assert!(err.contains("Argumento posicional inesperado"));
+    fn test_parse_multiple_positional_error() {
+        let args = vec!["disk1.vmdk".to_string(), "disk2.vmdk".to_string()];
+        let err = parse_args_from(args.into_iter()).unwrap_err();
+        assert!(err.contains("Unexpected positional argument"));
     }
 }

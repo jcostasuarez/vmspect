@@ -1,9 +1,9 @@
 [package]
 name = "vmspect"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Juan"]
-description = "Biblioteca en Rust para inspección estática, análisis y extracción de información de imágenes de disco de máquinas virtuales (VMDK, RAW, QCOW2, etc.)."
+description = "Blazing-fast static inspection, forensic analysis and information extraction library for virtual machine disk images (VMDK, RAW, QCOW2, VHD, VHDX, VDI)."
 license = "MIT OR Apache-2.0"
 readme = "readme.md"
 repository = "https://github.com/jcostasuarez/vmspect"

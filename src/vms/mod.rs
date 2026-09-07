@@ -1,9 +1,9 @@
-//! Capa de acceso a discos de máquinas virtuales.
+//! Disk access layer for virtual machines.
 //!
-//! - [`stream`]: fachada `LectorDisco` (nativo o `qemu-nbd`) y vista `Read + Seek`.
-//! - [`vmdk`]: parser nativo del formato VMDK (sparse, flat, multi-extent).
-//! - [`detector`]: tabla de particiones, sistemas de archivos y S.O. invitado.
-//! - [`discovery`]: descubrimiento, verificación de integridad y análisis de capacidades de inspección.
+//! - [`stream`]: `DiskReader` facade (native or `qemu-nbd`) and `Read + Seek` view.
+//! - [`vmdk`]: native VMDK parser (sparse, flat, multi-extent).
+//! - [`detector`]: partition table, file systems and guest OS detection.
+//! - [`discovery`]: discovery, integrity verification and inspection-capability analysis.
 
 pub(crate) mod detector;
 pub mod discovery;

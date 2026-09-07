@@ -1,42 +1,51 @@
 //! # vmspect
 //!
-//! `vmspect` es una biblioteca en Rust diseñada para la inspección estática,
-//! análisis y extracción de información en imágenes de disco de máquinas virtuales (VMDK, RAW, QCOW2, VHD, etc.).
+//! `vmspect` is a Rust library designed for the static inspection, analysis and
+//! information extraction of virtual machine disk images (VMDK, RAW, QCOW2, VHD, etc.).
 //!
-//! Permite examinar la estructura de particiones (MBR/GPT), identificar el Sistema Operativo hospedado (Windows/Linux)
-//! y extraer listas completas de software instalado de forma no invasiva (sin arrancar la VM ni montar el disco en el host).
+//! It can examine partition-table structures (MBR/GPT), identify the hosted operating
+//! system (Windows/Linux) and extract complete lists of installed software in a
+//! non-invasive way (without booting the VM or mounting the disk on the host).
 //!
-//! ## Características Principales
+//! ## Key Features
 //!
-//! - **Acceso Híbrido:** Parser nativo en Rust para formatos comunes (VMDK/RAW) con streaming dinámico ultra-liviano mediante `qemu-nbd` (TCP local) para formatos complejos (`QCOW2`, `VHDX`, `VDI`, etc.).
-//! - **Soporte Multi-OS:** Extracción completa de software desde el Registro de Windows (`NTFS`) e índices DPKG en Linux (`EXT4`).
-//! - **Extracción Agnóstica:** Recolección íntegra y sin filtros de software y metadatos de sistema.
-//! - **Reporte de Progreso Lock-Free:** Métricas atómicas e integrables con interfaces gráficas (Tauri/Egui/CLI) mediante [`InspectionProgress`].
-//! - **Graceful Shutdown y Preservación de Resultados:** Cancelación cooperativa limpia mediante [`CancellationToken`] que preserva todos los informes completados hasta la interrupción.
-//! - **Arquitectura Abierta:** Traits ([`VmDriver`], [`MemoryMapper`], [`InspectorOS`]) y motor extensible ([`MotorInspeccion`], [`ProcesadorConcurrente`]).
+//! - **Hybrid access:** Native Rust parser for common formats (VMDK/RAW) with a lightweight
+//!   dynamic-streaming layer via `qemu-nbd` (local TCP) for complex formats (`QCOW2`,
+//!   `VHDX`, `VDI`, ...).
+//! - **Multi-OS support:** Full software extraction from the Windows Registry (`NTFS`) and
+//!   DPKG indexes on Linux (`EXT4`).
+//! - **Agnostic extraction:** Complete and unfiltered collection of software and system
+//!   metadata.
+//! - **Lock-free progress reporting:** Atomic metrics that integrate cleanly with GUI
+//!   front-ends (Tauri / Egui / CLI) via [`InspectionProgress`].
+//! - **Graceful shutdown and result preservation:** Cooperative cancellation via
+//!   [`CancellationToken`] that preserves all completed reports up to the interruption.
+//! - **Open architecture:** Traits ([`VmDriver`], [`MemoryMapper`], [`OsInspector`]) and
+//!   an extensible engine ([`InspectionEngine`], [`ConcurrentProcessor`]).
 //!
-//! ## Ejemplo de Uso Rápido
+//! ## Quick Usage Example
 //!
 //! ```rust,no_run
 //! use std::path::Path;
 //! use vmspect::prelude::*;
 //!
 //! fn main() -> Result<()> {
-//!     let ruta = Path::new("disco_virtual.vmdk");
-//!     let opciones = Opciones::default();
+//!     let path = Path::new("virtual_disk.vmdk");
+//!     let options = Options::default();
 //!
-//!     let informe = inspeccionar_con_progreso(ruta, &opciones, |progreso: ProgresoInspeccion| {
-//!         println!("[{:>3}%] {} - {}", progreso.porcentaje, progreso.etapa, progreso.detalle.unwrap_or_default());
+//!     let report = inspect_with_progress(path, &options, |progress: InspectionProgressEvent| {
+//!         println!("[{:>3}%] {} - {}", progress.percentage, progress.stage,
+//!             progress.detail.unwrap_or_default());
 //!     })?;
 //!
-//!     println!("Sistema detectado: {:?}", informe.sistema_operativo);
-//!     println!("Programas hallados: {}", informe.programas.len());
+//!     println!("Detected OS: {:?}", report.operating_system);
+//!     println!("Found programs: {}", report.installed_programs.len());
 //!
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## Ejemplo de Procesamiento Concurrente con Cancelación y Resultados Parciales
+//! ## Concurrent Processing with Cancellation and Partial Results
 //!
 //! ```rust,no_run
 //! use std::path::PathBuf;
@@ -44,22 +53,22 @@
 //! use vmspect::prelude::*;
 //!
 //! fn main() -> Result<()> {
-//!     let rutas = vec![
+//!     let paths = vec![
 //!         PathBuf::from("vm1.vmdk"),
 //!         PathBuf::from("vm2.raw"),
 //!         PathBuf::from("vm3.qcow2"),
 //!     ];
 //!
 //!     let cancel = CancellationToken::new();
-//!     let opciones = Opciones::default().with_cancellation_token(&cancel);
-//!     let motor = MotorInspeccion::new(opciones);
+//!     let options = Options::default().with_cancellation_token(&cancel);
+//!     let engine = InspectionEngine::new(options);
 //!
-//!     // Se puede solicitar la cancelación en cualquier momento desde otro hilo:
+//!     // Cancellation can be requested from any thread:
 //!     // cancel.cancel();
 //!
-//!     // Devuelve los informes completados exitosamente antes y durante el shutdown:
-//!     let informes_completados = motor.inspeccionar_lote(rutas, 4)?;
-//!     println!("Informes preservados: {}", informes_completados.len());
+//!     // Returns the reports that completed successfully before and during shutdown:
+//!     let completed_reports = engine.inspect_batch(paths, 4)?;
+//!     println!("Preserved reports: {}", completed_reports.len());
 //!
 //!     Ok(())
 //! }
@@ -74,104 +83,101 @@ pub(crate) mod parsers;
 pub mod prelude;
 pub mod vms;
 
-// Re-exportaciones públicas de la API para aplanar el consumo desde la raíz del crate.
+// Flat public-API re-exports for ergonomic consumption from the crate root.
 pub use crate::vms::discovery::{
-    contar_vms, count_vms, es_extent_secundario, es_imagen_vm, has_vms, hay_vms,
-    is_secondary_extent, is_vm_image, list_vms, listar_vms, requiere_nbd, requiere_qemu,
-    requires_nbd, requires_qemu, verificar_integridad_imagen, verify_image_integrity,
+    count_vms, has_vms, is_secondary_extent, is_vm_image, list_vms, requires_nbd, requires_qemu,
+    verify_image_integrity,
 };
-pub use crate::vms::stream::DiscoVirtual;
-pub use engine::{InspectionEngine, MotorInspeccion, ProcesadorConcurrente};
+pub use crate::vms::stream::VirtualDisk;
+pub use engine::{ConcurrentProcessor, InspectionEngine};
 pub use error::{Result, VmSpectError};
 pub use models::{
-    formatear_bytes, CancellationToken, EsquemaParticion, Estadisticas, HerramientasGuest,
-    Hipervisor, InfoImagen, InformeInspeccion, InspectionProgress, InspectorOS, MemoryMapper,
-    Opciones, OpcionesInspeccion, Particion, Programa, ProgresoInspeccion, ProgresoSnapshot,
-    ResultadoAnalisis, SistemaArchivos, SistemaOperativo, VMInfo, VmDriver,
+    format_bytes, AnalysisResult, CancellationToken, FileSystem, GuestInfo, GuestTools, Hypervisor,
+    ImageInfo, InspectionOptions, InspectionProgress, InspectionProgressEvent, InspectionReport,
+    MemoryMapper, OperatingSystem, Options, OsInspector, Partition, PartitionScheme, Program,
+    ProgressSnapshot, Stats, VmDriver,
 };
 
 use std::path::Path;
 
-/// Realiza una inspección estática completa de una imagen de disco utilizando un callback de texto plano.
+/// Performs a full static inspection of a disk image using a plain-text callback.
 ///
-/// Esta función está diseñada principalmente para aplicaciones CLI o scripts de consola donde
-/// la salida de estado se imprime línea a línea mediante mensajes de texto (`&str`).
+/// This function is primarily designed for CLI applications or console scripts where
+/// status output is printed line by line via text messages (`&str`).
 ///
-/// # Parámetros
+/// # Parameters
 ///
-/// - `ruta_imagen`: Referencia al [`Path`] del archivo de disco virtual (`.vmdk`, `.raw`, etc.).
-/// - `opciones`: Configuración de la inspección ([`Opciones`]), que incluye control de análisis de apps/sistema y rutas.
-/// - `progreso`: Callback mutable que recibe referencias a cadenas de texto (`&str`) con la descripción del paso actual.
+/// - `image_path`: Reference to the [`Path`] of the virtual disk file (`.vmdk`, `.raw`, ...).
+/// - `options`: Inspection configuration ([`Options`]), which controls apps/system analysis and paths.
+/// - `progress`: Mutable callback receiving `&str` references with the description of the current step.
 ///
-/// # Errores
+/// # Errors
 ///
-/// Devuelve un [`VmSpectError`] si:
-/// - El archivo en `ruta_imagen` no existe ([`VmSpectError::ImageNotFound`]).
-/// - La inspección fue cancelada por el usuario ([`VmSpectError::Cancelled`]).
-/// - Ocurre un error de lectura de I/O en la imagen ([`VmSpectError::Io`]).
-/// - La imagen requiere el servidor `qemu-nbd` y el ejecutable no está disponible ([`VmSpectError::QemuNotFound`]).
-/// - No se puede reconocer la tabla de particiones o el sistema de archivos subyacente ([`VmSpectError::FileSystem`]).
+/// Returns a [`VmSpectError`] if:
+/// - The file at `image_path` does not exist ([`VmSpectError::ImageNotFound`]).
+/// - The inspection was cancelled by the user ([`VmSpectError::Cancelled`]).
+/// - An I/O read error occurs on the image ([`VmSpectError::Io`]).
+/// - The image requires the `qemu-nbd` server and the executable is unavailable
+///   ([`VmSpectError::QemuNotFound`]).
+/// - The partition table or underlying file system cannot be recognized
+///   ([`VmSpectError::FileSystem`]).
 ///
-/// # Ejemplo
+/// # Example
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// use vmspect::{inspeccionar, Opciones};
+/// use vmspect::{inspect, Options};
 ///
-/// let ruta = Path::new("C:\\VMs\\Windows10.vmdk");
-/// let opciones = Opciones::default();
+/// let path = Path::new("C:\\VMs\\Windows10.vmdk");
+/// let options = Options::default();
 ///
-/// let resultado = inspeccionar(ruta, &opciones, &mut |mensaje| {
-///     println!("LOG: {}", mensaje);
+/// let result = inspect(path, &options, &mut |message| {
+///     println!("LOG: {}", message);
 /// });
 /// ```
-pub fn inspeccionar(
-    ruta_imagen: &Path,
-    opciones: &Opciones,
-    progreso: &mut dyn FnMut(&str),
-) -> Result<InformeInspeccion> {
-    let motor = MotorInspeccion::new(opciones.clone());
-    motor.inspeccionar_con_progreso(ruta_imagen, |p| {
-        let msg = match &p.detalle {
-            Some(d) => format!("[{:>3}%] {} - {}", p.porcentaje, p.etapa, d),
-            None => format!("[{:>3}%] {}", p.porcentaje, p.etapa),
+pub fn inspect(
+    image_path: &Path,
+    options: &Options,
+    progress: &mut dyn FnMut(&str),
+) -> Result<InspectionReport> {
+    let engine = InspectionEngine::new(options.clone());
+    engine.inspect_with_progress(image_path, |p| {
+        let msg = match &p.detail {
+            Some(d) => format!("[{:>3}%] {} - {}", p.percentage, p.stage, d),
+            None => format!("[{:>3}%] {}", p.percentage, p.stage),
         };
-        progreso(&msg);
+        progress(&msg);
     })
 }
 
-/// Realiza una inspección estática reportando eventos de progreso estructurados (`0` al `100%`).
+/// Performs a static inspection reporting structured progress events (`0` to `100%`).
 ///
-/// Esta función es la opción recomendada para integraciones con entornos de interfaz gráfica (como **Tauri**, **Electron** o **Egui**),
-/// ya que emite una estructura [`ProgresoInspeccion`] serializable con porcentajes acotados y descripciones de la etapa actual.
+/// This is the recommended option for integrations with GUI environments (such as **Tauri**,
+/// **Electron** or **Egui**), as it emits a serializable [`InspectionProgressEvent`] with
+/// bounded percentages and descriptions of the current stage.
 ///
-/// # Parámetros
+/// # Parameters
 ///
-/// - `ruta_imagen`: Referencia al [`Path`] de la imagen de disco virtual.
-/// - `opciones`: Configuración del motor ([`Opciones`]).
-/// - `callback_progreso`: Un closure que implementa `FnMut(ProgresoInspeccion)`, invocado secuencialmente durante el análisis.
+/// - `image_path`: Reference to the [`Path`] of the virtual disk image.
+/// - `options`: Engine configuration ([`Options`]).
+/// - `progress_callback`: Closure implementing `FnMut(InspectionProgressEvent)`, invoked
+///   sequentially during the analysis.
 ///
-/// # Flujo de Porcentajes Emitidos
+/// # Emitted Percentage Flow
 ///
-/// - **`5% - 15%`**: Identificación del formato de la imagen y apertura del backend de lectura.
-/// - **`25% - 45%`**: Detección del esquema de particionado (MBR/GPT) y firmas de File System.
-/// - **`55%`**: Análisis profundo del SO (extracción de Registro NTFS / paquetes DPKG).
-/// - **`90%`**: Generación y consolidación del informe.
-/// - **`100%`**: Finalización del reporte y cálculo de métricas de rendimiento.
-pub fn inspeccionar_con_progreso<F>(
-    ruta_imagen: &Path,
-    opciones: &Opciones,
-    callback_progreso: F,
-) -> Result<InformeInspeccion>
+/// - **`5% - 15%`**: Image format identification and read-backend setup.
+/// - **`25% - 45%`**: Partitioning scheme (MBR/GPT) and file-system signature detection.
+/// - **`55%`**: Deep OS analysis (NTFS Registry / DPKG package extraction).
+/// - **`90%`**: Report generation and consolidation.
+/// - **`100%`**: Final report delivery and performance metrics computation.
+pub fn inspect_with_progress<F>(
+    image_path: &Path,
+    options: &Options,
+    progress_callback: F,
+) -> Result<InspectionReport>
 where
-    F: FnMut(ProgresoInspeccion),
+    F: FnMut(InspectionProgressEvent),
 {
-    let motor = MotorInspeccion::new(opciones.clone());
-    motor.inspeccionar_con_progreso(ruta_imagen, callback_progreso)
+    let engine = InspectionEngine::new(options.clone());
+    engine.inspect_with_progress(image_path, progress_callback)
 }
-
-/// Alias en inglés para [`inspeccionar`].
-pub use inspeccionar as inspect;
-
-/// Alias en inglés para [`inspeccionar_con_progreso`].
-pub use inspeccionar_con_progreso as inspect_with_progress;

@@ -1,4 +1,4 @@
-//! Módulo principal de estructuras de datos y traits del dominio.
+//! Main module of domain data structures and traits.
 
 pub mod image;
 pub mod options;
@@ -6,12 +6,12 @@ pub mod partition;
 pub mod software;
 pub mod traits;
 
-// Re-exportaciones para facilitar el acceso plano dentro del submódulo models
-pub use image::{formatear_bytes, Estadisticas, Hipervisor, InfoImagen};
+// Re-exports to facilitate flat access within the `models` submodule.
+pub use image::{format_bytes, Hypervisor, ImageInfo, Stats};
 pub use options::{
-    CancellationToken, InformeInspeccion, InspectionProgress, Opciones, OpcionesInspeccion,
-    ProgresoInspeccion, ProgresoSnapshot,
+    CancellationToken, InspectionOptions, InspectionProgress, InspectionProgressEvent,
+    InspectionReport, Options, ProgressSnapshot,
 };
-pub use partition::{EsquemaParticion, Particion, SistemaArchivos, SistemaOperativo};
-pub use software::{HerramientasGuest, Programa, VMInfo};
-pub use traits::{InspectorOS, MemoryMapper, ResultadoAnalisis, VmDriver};
+pub use partition::{FileSystem, OperatingSystem, Partition, PartitionScheme};
+pub use software::{GuestInfo, GuestTools, Program};
+pub use traits::{AnalysisResult, MemoryMapper, OsInspector, VmDriver};

@@ -7,6 +7,30 @@ y este proyecto se adhiere al [Versionado Semántico](https://semver.org/lang/es
 la versión mayor sea `0`, los incrementos de la versión menor pueden incluir cambios
 incompatibles, según lo previsto por SemVer para la serie `0.y.z`).
 
+## [0.2.1] - 2026-09-06
+
+Primera versión estable para producción con degradación elegante de errores en sistemas de archivos/registros, inspección NTFS fallback y detección agnóstica multi-hipervisor de herramientas de integración para invitados.
+
+### Añadido
+
+- **Graceful Degradation & Permissive Reading:**
+  - Resiliencia integral ante colmenas de Registro de Windows dañadas o "sucias" (como `SequenceNumberMismatch` originado por apagados abruptos o snapshots en caliente) utilizando `Hive::without_validation` y aislando fallos/panics internos de librerías de terceros con `std::panic::catch_unwind`.
+  - Recolección y propagación de advertencias no fatales en el campo `advertencias: Vec<String>` de `InformeInspeccion`, permitiendo que el análisis continúe y extraiga la mayor cantidad posible de información sin abortar el pipeline.
+- **Fallback NTFS:**
+  - Inspección directa de fallback para sistemas Windows cuando el Registro es inaccesible o corrupto: extracción de metadatos de versión y compilación del SO directamente desde el encabezado PE del ejecutable del kernel (`\Windows\System32\ntoskrnl.exe`).
+  - Escaneo de fallback del catálogo de software instalado recorriendo `\Program Files` y `\Program Files (x86)`, etiquetando los programas detectados con `origen: Some("FallbackFS")`.
+- **Detección Agnóstica Multi-Hipervisor de Guest Tools:**
+  - Soporte multi-hipervisor en la nueva estructura `HerramientasGuest`: detección y extracción de versión de **VMware Tools**, **VirtualBox Guest Additions**, **QEMU Guest Agent** y **Hyper-V Integration Services** tanto en Windows (vía Registro y fallback de FS) como en Linux (vía paquetes `dpkg` e inicialización).
+- **Sección de Advertencias en CLI y JSON:**
+  - Despliegue visual formateado de la lista `advertencias` en la terminal mediante la interfaz CLI humana y en la salida estructurada `--json`.
+
+### Cambiado
+
+- Estructura `VMInfo`: el campo de herramientas de virtualización ahora expone `guest_tools: Option<HerramientasGuest>` en lugar de una cadena simple, ofreciendo una API agnóstica y tipada con `tipo`, `version` y `presente`.
+- Modelo `Programa`: nuevo campo `origen: Option<String>` con serialización por defecto para distinguir software extraído del Registro vs. fallback del sistema de archivos.
+
+---
+
 ## [0.2.0] - 2026-09-06
 
 Release de consolidación de API, backend `qemu-nbd` híbrido y procesamiento concurrente,

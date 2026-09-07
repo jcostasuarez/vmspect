@@ -4,20 +4,30 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)]()
 
-`vmspect` es una biblioteca (crate) en Rust para la **inspección estática, análisis forense y extracción de información de imágenes de disco de máquinas virtuales** (VMDK, RAW, QCOW2, VHD, VHDX, VDI, etc.).
+`vmspect` es una biblioteca (crate) y herramienta CLI en Rust para la **inspección estática ultra-rápida, análisis forense y extracción de información de imágenes de disco de máquinas virtuales** (VMDK, RAW, QCOW2, VHD, VHDX, VDI, etc.).
 
-Permite examinar la estructura de particiones (MBR/GPT), identificar el Sistema Operativo huésped (Windows/Linux) y extraer listas completas de software instalado y metadatos de forma **no invasiva** (sin arrancar la máquina virtual ni requerir permisos de montaje en el host).
+Permite examinar la estructura de particiones (MBR/GPT), identificar el Sistema Operativo huésped (Windows/Linux), extraer listas completas de software instalado y detectar herramientas de integración (Guest Tools) de forma **no invasiva** (sin arrancar la máquina virtual ni requerir permisos de montaje en el host).
 
 ---
 
 ## 🚀 Características Principales
 
-- **Acceso Híbrido y Liviano:**
-  - **Parser nativo en Rust:** Lectura directa y de alto rendimiento para imágenes `RAW` y `VMDK` (`monolithicSparse`, `monolithicFlat`, `twoGbMaxExtentFlat/Sparse`, etc.) sin dependencias externas ni procesos secundarios.
-  - **Servidor `qemu-nbd` integrado:** Para formatos complejos (`QCOW2`, `VHDX`, `VDI`, VMDK comprimidos/streamOptimized), conecta mediante socket TCP local (`127.0.0.1`) con el protocolo NBD estándar, con streaming directo de bloques y sin archivos temporales en disco.
-- **Sistemas Operativos Huésped:**
-  - **Windows (NTFS):** Extrae las colmenas del Registro (`SOFTWARE` y `SYSTEM`) parseando llaves de desinstalación (32 y 64 bits), versión del sistema operativo, compilación (Build), Service Pack y versión de *VMware Tools*.
-  - **Linux (ext2 / ext3 / ext4):** Lee `/etc/os-release`, `/etc/hostname` y analiza la base de datos de paquetes `/var/lib/dpkg/status` junto con *open-vm-tools*.
+- **Rendimiento eficiente y streaming liviano:**
+  - **Parser nativo en Rust:** Lectura directa y de latencia ultra-baja para imágenes `RAW` y `VMDK` (`monolithicSparse`, `monolithicFlat`, `twoGbMaxExtentFlat/Sparse`, etc.) sin dependencias externas ni procesos secundarios.
+  - **Servidor `qemu-nbd` integrado:** Para formatos complejos (`QCOW2`, `VHDX`, `VDI`, VMDK comprimidos/streamOptimized), conecta mediante socket TCP local (`127.0.0.1`) o sockets UNIX con el protocolo NBD estándar, con streaming directo de bloques y sin archivos temporales en disco.
+- **Resiliencia ante Registros Sucios y Fallback NTFS (Graceful Degradation):**
+  - **Lectura permisiva del Registro de Windows:** Tolerancia a colmenas de Registro sucias o dañadas (`SequenceNumberMismatch` provocado por apagados abruptos o snapshots en caliente) utilizando `Hive::without_validation` y aislamiento de panics internos con `catch_unwind`.
+  - **Inspección NTFS Fallback:** En caso de colmenas de Registro totalmente inaccesibles, `vmspect` degrada elegantemente inspeccionando directamente el encabezado PE de `\Windows\System32\ntoskrnl.exe` para extraer compilación y versión del SO, y escanea `\Program Files` marcando las aplicaciones con `origen: Some("FallbackFS")`.
+  - **Lista de Advertencias no fatales:** Reporte de incidencias en el campo `advertencias` del informe sin abortar el pipeline de inspección.
+- **Detección Agnóstica Multi-Hipervisor de Guest Tools:**
+  - Soporte completo y tipado en la estructura `HerramientasGuest` para identificar y extraer la versión de:
+    - **VMware Tools / open-vm-tools**
+    - **VirtualBox Guest Additions**
+    - **QEMU Guest Agent**
+    - **Hyper-V Integration Services**
+- **Sistemas Operativos Huésped Soportados:**
+  - **Windows (NTFS):** Extrae las colmenas del Registro (`SOFTWARE` y `SYSTEM`) parseando llaves de desinstalación (32 y 64 bits), versión del sistema operativo, compilación (Build), Service Pack y Guest Tools.
+  - **Linux (ext2 / ext3 / ext4):** Lee `/etc/os-release`, `/etc/hostname` y analiza la base de datos de paquetes `/var/lib/dpkg/status` junto con agentes de virtualización.
 - **Detección de Esquemas y Sistemas de Archivos:**
   - Esquemas de particionado: **MBR**, **GPT** y **Volúmenes sin tabla de particiones**.
   - Reconocimiento de firmas: **NTFS**, **FAT12/16/32**, **ext2/3/4**, **XFS**, **Btrfs**, **LVM2 PV**, **Linux Swap**.
@@ -26,7 +36,7 @@ Permite examinar la estructura de particiones (MBR/GPT), identificar el Sistema 
   - Soporte de banderas `--noapps` (desactiva recolección de aplicaciones) y `--nosystem` (desactiva recolección de metadatos del SO).
 - **Diseñado para UI y CLI:**
   - Emisión de eventos de progreso en porcentajes estructurados (`0%` a `100%`) ideales para **Tauri**, **egui** o **Electron**.
-  - Soporte de cancelación mediante tokens atómicos (`Arc<AtomicBool>` / `CancellationToken`).
+  - Soporte de cancelación mediante tokens atómicos (`Arc<AtomicBool>` / `CancellationToken`) preservando resultados parciales.
 
 ---
 
@@ -72,14 +82,14 @@ Añade `vmspect` a tu `Cargo.toml`:
 
 ```toml
 [dependencies]
-vmspect = "0.2"
+vmspect = "0.2.1"
 ```
 
 ---
 
-## 💡 Ejemplos de Uso
+## 💡 Ejemplos de Uso como Biblioteca
 
-### 1. Inspección Rápida con Progreso en Consola
+### 1. Inspección Completa con Guest Tools, Advertencias y Progreso
 
 ```rust
 use std::path::Path;
@@ -87,6 +97,8 @@ use vmspect::{inspeccionar_con_progreso, Opciones, ProgresoInspeccion};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ruta = Path::new("disco_virtual.vmdk");
+    
+    // Configuración de opciones (ej. análisis completo de SO y aplicaciones)
     let opciones = Opciones::default();
 
     let informe = inspeccionar_con_progreso(ruta, &opciones, |p: ProgresoInspeccion| {
@@ -96,15 +108,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Formato de disco: {}", informe.imagen.formato);
     println!("Sistema Operativo: {:?}", informe.sistema_operativo);
     println!("Detalles SO: {}", informe.vm_info.os_cadena_formateada());
+    
+    // Detección agnóstica de Guest Tools (VMware, VirtualBox, QEMU, Hyper-V)
+    if let Some(ref tools) = informe.vm_info.guest_tools {
+        if tools.presente {
+            println!("Herramientas Guest: {} (Versión: {})", tools.tipo, tools.version.as_deref().unwrap_or("N/D"));
+        }
+    }
+
+    // Advertencias no fatales (degradación elegante de registro/filesystem)
+    if !informe.advertencias.is_empty() {
+        println!("Advertencias de inspección:");
+        for adv in &informe.advertencias {
+            println!("  [!] {}", adv);
+        }
+    }
+
     println!("Particiones detectadas: {}", informe.particiones.len());
     println!("Software instalado encontrado: {}", informe.programas.len());
 
     for prog in informe.programas.iter().take(10) {
-        println!(" - {} (v{}) [Editor: {}]", prog.nombre, prog.version.as_deref().unwrap_or("N/D"), prog.editor.as_deref().unwrap_or("N/D"));
+        let origen = prog.origen.as_deref().map(|o| format!(" [{}]", o)).unwrap_or_default();
+        println!(
+            " - {} (v{}) [Editor: {}]{}",
+            prog.nombre,
+            prog.version.as_deref().unwrap_or("N/D"),
+            prog.editor.as_deref().unwrap_or("N/D"),
+            origen
+        );
     }
 
     Ok(())
 }
+```
+
+### 2. Opciones Avanzadas de Extracción
+
+```rust
+use vmspect::Opciones;
+
+// Desactivar extracción de apps o sistema según necesidades de rendimiento:
+let opciones_ligeras = Opciones {
+    noapps: true,          // Omite escaneo de software instalado
+    nosystem: false,       // Conserva detección de SO y Guest Tools
+    forzar_nbd: false,     // Usa parser nativo ultra-rápido si está disponible
+    ..Opciones::default()
+};
+
+assert!(!opciones_ligeras.should_analyze_apps());
+assert!(opciones_ligeras.should_analyze_system());
 ```
 
 ### 3. Procesamiento Concurrente y Preservación de Resultados ante Cancelación
@@ -166,23 +218,27 @@ async fn inspeccionar_vm(app_handle: tauri::AppHandle, ruta: String) -> Result<I
 }
 ```
 
-### 5. Control de Cancelación mediante Tokens
+---
 
-```rust
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::path::Path;
-use vmspect::{inspeccionar, Opciones};
+## 🖥️ Uso desde Línea de Comandos (CLI)
 
-let cancel_token = Arc::new(AtomicBool::new(false));
+`vmspect` incluye un binario de alto rendimiento para terminal:
 
-let opciones = Opciones {
-    cancel_token: Some(cancel_token.clone()),
-    ..Opciones::default()
-};
+```bash
+# Inspección estándar con salida formateada para humanos:
+vmspect /ruta/a/disco.vmdk
 
-// En cualquier momento desde otro hilo:
-// cancel_token.store(true, Ordering::Release);
+# Salida estructurada en JSON (ideal para scripts, pipelines CI/CD y análisis forense):
+vmspect /ruta/a/disco.qcow2 --json
+
+# Escaneo concurrente y recursivo de un directorio completo de VMs:
+vmspect /var/lib/libvirt/images/ --concurrente --recursivo --workers 8
+
+# Inspección rápida omitiendo extracción de aplicaciones:
+vmspect /ruta/a/disco.vhdx --noapps
+
+# Inspección omitiendo metadatos del SO:
+vmspect /ruta/a/disco.raw --nosystem
 ```
 
 ---

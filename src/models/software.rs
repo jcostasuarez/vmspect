@@ -19,6 +19,17 @@ pub struct Programa {
     pub origen: Option<String>,
 }
 
+/// Información sobre las herramientas de integración para invitados (Guest Tools / Additions / Agents).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HerramientasGuest {
+    /// Tipo o suite de herramientas (ej. "VMware Tools", "VirtualBox Guest Additions", "QEMU Guest Agent", "Hyper-V Integration Services").
+    pub tipo: String,
+    /// Versión instalada de las herramientas, si está disponible (ej. "13.0.5.0", "7.0.12").
+    pub version: Option<String>,
+    /// Indica si las herramientas o servicios de integración están presentes en el sistema huésped.
+    pub presente: bool,
+}
+
 /// Contiene los metadatos detallados del sistema operativo detectado y sus componentes.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct VMInfo {
@@ -30,8 +41,8 @@ pub struct VMInfo {
     pub os_service_pack: String,
     /// Número de compilación (Build) del SO.
     pub os_build: String,
-    /// Versión detectada de las herramientas de integración (ej. "open-vm-tools 12.4.5").
-    pub vmtools_version: Option<String>,
+    /// Información sobre herramientas de integración para invitados (Guest Tools / Additions / Agents).
+    pub guest_tools: Option<HerramientasGuest>,
 }
 
 impl VMInfo {
@@ -89,5 +100,17 @@ mod tests {
         assert_eq!(prog.version.as_deref(), Some("3.0.2"));
         assert_eq!(prog.editor.as_deref(), Some("libs"));
         assert_eq!(prog.origen, None);
+    }
+
+    #[test]
+    fn test_herramientas_guest_serializacion() {
+        let tools = HerramientasGuest {
+            tipo: "VirtualBox Guest Additions".to_string(),
+            version: Some("7.0.12".to_string()),
+            presente: true,
+        };
+        assert_eq!(tools.tipo, "VirtualBox Guest Additions");
+        assert_eq!(tools.version.as_deref(), Some("7.0.12"));
+        assert!(tools.presente);
     }
 }

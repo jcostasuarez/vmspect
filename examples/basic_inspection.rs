@@ -36,8 +36,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         informe.sistema_operativo
     );
     println!("Detalles SO: {}", informe.vm_info.os_cadena_formateada());
-    if let Some(ref vmtools) = informe.vm_info.vmtools_version {
-        println!("VMware Tools: {}", vmtools);
+    if let Some(ref tools) = informe.vm_info.guest_tools {
+        if tools.presente {
+            println!(
+                "Guest Tools: {} (Versión: {})",
+                tools.tipo,
+                tools.version.as_deref().unwrap_or("N/D")
+            );
+        }
     }
     println!("Particiones encontradas: {}", informe.particiones.len());
     for p in &informe.particiones {

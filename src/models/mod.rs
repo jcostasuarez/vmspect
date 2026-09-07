@@ -13,5 +13,5 @@ pub use options::{
     ProgresoInspeccion, ProgresoSnapshot,
 };
 pub use partition::{EsquemaParticion, Particion, SistemaArchivos, SistemaOperativo};
-pub use software::{Programa, VMInfo};
+pub use software::{HerramientasGuest, Programa, VMInfo};
 pub use traits::{InspectorOS, MemoryMapper, ResultadoAnalisis, VmDriver};

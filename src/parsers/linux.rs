@@ -4,7 +4,7 @@
 //! la partición en el sistema operativo anfitrión.
 use crate::error::Result;
 use crate::models::traits::{InspectorOS, ResultadoAnalisis, VmDriver};
-use crate::models::{Opciones, Particion, Programa, SistemaArchivos, VMInfo};
+use crate::models::{HerramientasGuest, Opciones, Particion, Programa, SistemaArchivos, VMInfo};
 use crate::vms::stream::DiscoVirtual;
 use ext4::SuperBlock;
 use positioned_io::ReadAt;
@@ -87,15 +87,19 @@ fn analizar_sistema_archivos<R: ReadAt>(
     }
 
     if let Ok(dpkg_status) = leer_archivo_texto(sb, "/var/lib/dpkg/status") {
-        let (pkgs, vmtools_ver) = parsear_dpkg_status(&dpkg_status, opciones);
+        let (pkgs, guest_tools) = parsear_dpkg_status(&dpkg_status, opciones);
         if opciones.debe_analizar_apps() {
             programas.extend(pkgs);
         }
         if opciones.debe_analizar_sistema() {
-            if let Some(ver) = vmtools_ver {
-                vm_info.vmtools_version = Some(ver);
+            if let Some(tools) = guest_tools {
+                vm_info.guest_tools = Some(tools);
             }
         }
+    }
+
+    if opciones.debe_analizar_sistema() && vm_info.guest_tools.is_none() {
+        vm_info.guest_tools = detectar_guest_tools_archivos_linux(sb);
     }
 
     if opciones.debe_analizar_apps() {
@@ -111,9 +115,96 @@ fn analizar_sistema_archivos<R: ReadAt>(
     })
 }
 
-fn parsear_dpkg_status(contenido: &str, opciones: &Opciones) -> (Vec<Programa>, Option<String>) {
+/// Inspecciona binarios o unidades de servicio del sistema operativo invitado Linux
+/// para detectar suites de herramientas de integración (VMware Tools, VirtualBox Guest Additions,
+/// QEMU Guest Agent y Hyper-V Integration Services) cuando no provienen del gestor de paquetes.
+fn detectar_guest_tools_archivos_linux<R: ReadAt>(sb: &SuperBlock<R>) -> Option<HerramientasGuest> {
+    // 1. VMware
+    let rutas_vmware = [
+        "/usr/bin/vmtoolsd",
+        "/usr/sbin/vmtoolsd",
+        "/bin/vmtoolsd",
+        "/sbin/vmtoolsd",
+        "/etc/vmware-tools",
+        "/lib/systemd/system/open-vm-tools.service",
+        "/etc/systemd/system/open-vm-tools.service",
+    ];
+    for ruta in &rutas_vmware {
+        if sb.resolve_path(ruta).is_ok() {
+            return Some(HerramientasGuest {
+                tipo: "VMware Tools".to_string(),
+                version: None,
+                presente: true,
+            });
+        }
+    }
+
+    // 2. VirtualBox
+    let rutas_vbox = [
+        "/usr/sbin/VBoxService",
+        "/usr/bin/VBoxService",
+        "/usr/sbin/vboxservice",
+        "/usr/bin/vboxservice",
+        "/sbin/VBoxService",
+        "/lib/systemd/system/vboxadd-service.service",
+        "/etc/systemd/system/vboxadd-service.service",
+        "/opt/VBoxGuestAdditions",
+    ];
+    for ruta in &rutas_vbox {
+        if sb.resolve_path(ruta).is_ok() {
+            return Some(HerramientasGuest {
+                tipo: "VirtualBox Guest Additions".to_string(),
+                version: None,
+                presente: true,
+            });
+        }
+    }
+
+    // 3. QEMU Guest Agent
+    let rutas_qemu = [
+        "/usr/bin/qemu-ga",
+        "/usr/sbin/qemu-ga",
+        "/lib/systemd/system/qemu-guest-agent.service",
+        "/etc/systemd/system/qemu-guest-agent.service",
+    ];
+    for ruta in &rutas_qemu {
+        if sb.resolve_path(ruta).is_ok() {
+            return Some(HerramientasGuest {
+                tipo: "QEMU Guest Agent".to_string(),
+                version: None,
+                presente: true,
+            });
+        }
+    }
+
+    // 4. Hyper-V
+    let rutas_hyperv = [
+        "/usr/sbin/hv_kvp_daemon",
+        "/usr/bin/hv_kvp_daemon",
+        "/usr/sbin/hv_vss_daemon",
+        "/usr/sbin/hv_fcopy_daemon",
+        "/lib/systemd/system/hv-kvp-daemon.service",
+        "/lib/systemd/system/hypervkvp.service",
+    ];
+    for ruta in &rutas_hyperv {
+        if sb.resolve_path(ruta).is_ok() {
+            return Some(HerramientasGuest {
+                tipo: "Hyper-V Integration Services".to_string(),
+                version: None,
+                presente: true,
+            });
+        }
+    }
+
+    None
+}
+
+fn parsear_dpkg_status(
+    contenido: &str,
+    opciones: &Opciones,
+) -> (Vec<Programa>, Option<HerramientasGuest>) {
     let mut paquetes = Vec::new();
-    let mut version_vmtools = None;
+    let mut guest_tools: Option<HerramientasGuest> = None;
 
     let mut pkg_actual = String::new();
     let mut ver_actual = String::new();
@@ -127,11 +218,48 @@ fn parsear_dpkg_status(contenido: &str, opciones: &Opciones) -> (Vec<Programa>, 
                             sec: &str,
                             inst: bool,
                             pkgs: &mut Vec<Programa>,
-                            vmtools_ver: &mut Option<String>| {
+                            tools: &mut Option<HerramientasGuest>| {
         if inst && !pkg.is_empty() {
-            // Capturar la versión explícita para las herramientas de integración
-            if (pkg == "open-vm-tools" || pkg == "open-vm-tools-desktop") && vmtools_ver.is_none() {
-                *vmtools_ver = Some(format!("open-vm-tools {}", ver));
+            // Capturar herramientas de integración agnósticas del hipervisor
+            if tools.is_none() {
+                let ver_opt = if !ver.is_empty() {
+                    Some(ver.to_string())
+                } else {
+                    None
+                };
+
+                if pkg == "open-vm-tools" || pkg == "open-vm-tools-desktop" {
+                    *tools = Some(HerramientasGuest {
+                        tipo: "VMware Tools".to_string(),
+                        version: ver_opt,
+                        presente: true,
+                    });
+                } else if pkg == "virtualbox-guest-utils"
+                    || pkg == "virtualbox-guest-x11"
+                    || pkg == "virtualbox-guest-dkms"
+                    || pkg == "virtualbox-guest-additions-iso"
+                {
+                    *tools = Some(HerramientasGuest {
+                        tipo: "VirtualBox Guest Additions".to_string(),
+                        version: ver_opt,
+                        presente: true,
+                    });
+                } else if pkg == "qemu-guest-agent" {
+                    *tools = Some(HerramientasGuest {
+                        tipo: "QEMU Guest Agent".to_string(),
+                        version: ver_opt,
+                        presente: true,
+                    });
+                } else if pkg == "hyperv-daemons"
+                    || pkg == "hv-kvp-daemon-init"
+                    || pkg == "linux-cloud-tools-virtual"
+                {
+                    *tools = Some(HerramientasGuest {
+                        tipo: "Hyper-V Integration Services".to_string(),
+                        version: ver_opt,
+                        presente: true,
+                    });
+                }
             }
 
             if debe_apps {
@@ -179,7 +307,7 @@ fn parsear_dpkg_status(contenido: &str, opciones: &Opciones) -> (Vec<Programa>, 
                 &seccion_actual,
                 instalado,
                 &mut paquetes,
-                &mut version_vmtools,
+                &mut guest_tools,
             );
             pkg_actual.clear();
             ver_actual.clear();
@@ -195,10 +323,10 @@ fn parsear_dpkg_status(contenido: &str, opciones: &Opciones) -> (Vec<Programa>, 
         &seccion_actual,
         instalado,
         &mut paquetes,
-        &mut version_vmtools,
+        &mut guest_tools,
     );
 
-    (paquetes, version_vmtools)
+    (paquetes, guest_tools)
 }
 
 /// Lee un archivo de texto de la partición ext4 y lo devuelve como String.
@@ -294,10 +422,14 @@ Section: python
 Version: 3.10.6-1~22.04
 "#;
         let opciones = Opciones::default();
-        let (paquetes, vmtools) = parsear_dpkg_status(dpkg, &opciones);
+        let (paquetes, tools) = parsear_dpkg_status(dpkg, &opciones);
         assert_eq!(
-            vmtools.as_deref(),
-            Some("open-vm-tools 2:12.1.5-1ubuntu0.22.04.4")
+            tools,
+            Some(HerramientasGuest {
+                tipo: "VMware Tools".to_string(),
+                version: Some("2:12.1.5-1ubuntu0.22.04.4".to_string()),
+                presente: true,
+            })
         );
         // Debe incluir TODOS los paquetes sin filtrar por librerías, prefijos o sufijos
         assert_eq!(paquetes.len(), 4);
@@ -326,11 +458,69 @@ Version: 2.0.11-1ubuntu1.1
             noapps: true,
             ..Opciones::default()
         };
-        let (paquetes, vmtools) = parsear_dpkg_status(dpkg, &opciones);
+        let (paquetes, tools) = parsear_dpkg_status(dpkg, &opciones);
         assert_eq!(
-            vmtools.as_deref(),
-            Some("open-vm-tools 2:12.1.5-1ubuntu0.22.04.4")
+            tools,
+            Some(HerramientasGuest {
+                tipo: "VMware Tools".to_string(),
+                version: Some("2:12.1.5-1ubuntu0.22.04.4".to_string()),
+                presente: true,
+            })
         );
         assert!(paquetes.is_empty());
+    }
+
+    #[test]
+    fn test_parsear_dpkg_status_hipervisores_multiples() {
+        let dpkg_vbox = r#"
+Package: virtualbox-guest-utils
+Status: install ok installed
+Priority: optional
+Section: admin
+Version: 7.0.12-dfsg-1
+"#;
+        let (_, tools_vbox) = parsear_dpkg_status(dpkg_vbox, &Opciones::default());
+        assert_eq!(
+            tools_vbox,
+            Some(HerramientasGuest {
+                tipo: "VirtualBox Guest Additions".to_string(),
+                version: Some("7.0.12-dfsg-1".to_string()),
+                presente: true,
+            })
+        );
+
+        let dpkg_qemu = r#"
+Package: qemu-guest-agent
+Status: install ok installed
+Priority: optional
+Section: admin
+Version: 1:8.2.2+ds-0ubuntu1
+"#;
+        let (_, tools_qemu) = parsear_dpkg_status(dpkg_qemu, &Opciones::default());
+        assert_eq!(
+            tools_qemu,
+            Some(HerramientasGuest {
+                tipo: "QEMU Guest Agent".to_string(),
+                version: Some("1:8.2.2+ds-0ubuntu1".to_string()),
+                presente: true,
+            })
+        );
+
+        let dpkg_hyperv = r#"
+Package: hyperv-daemons
+Status: install ok installed
+Priority: optional
+Section: admin
+Version: 5.15.0-91.101
+"#;
+        let (_, tools_hyperv) = parsear_dpkg_status(dpkg_hyperv, &Opciones::default());
+        assert_eq!(
+            tools_hyperv,
+            Some(HerramientasGuest {
+                tipo: "Hyper-V Integration Services".to_string(),
+                version: Some("5.15.0-91.101".to_string()),
+                presente: true,
+            })
+        );
     }
 }

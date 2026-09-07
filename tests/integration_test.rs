@@ -165,31 +165,37 @@ fn test_extraccion_agnostica_sin_reglas_ni_filtros() {
             nombre: "libc6".to_string(),
             version: Some("2.35-0ubuntu3".to_string()),
             editor: Some("libs".to_string()),
+            origen: None,
         },
         Programa {
             nombre: "python3-minimal".to_string(),
             version: Some("3.10.6-1".to_string()),
             editor: Some("python".to_string()),
+            origen: None,
         },
         Programa {
             nombre: "libssl3".to_string(),
             version: Some("3.0.2-0ubuntu1".to_string()),
             editor: Some("libs".to_string()),
+            origen: None,
         },
         Programa {
             nombre: "linux-image-5.15.0-generic".to_string(),
             version: Some("5.15.0-88.98".to_string()),
             editor: Some("kernel".to_string()),
+            origen: None,
         },
         Programa {
             nombre: "Siemens TIA Portal V18".to_string(),
             version: Some("18.0".to_string()),
             editor: Some("Siemens AG".to_string()),
+            origen: None,
         },
         Programa {
             nombre: "Microsoft Visual C++ 2015-2022 Redistributable (x64)".to_string(),
             version: Some("14.36.32532".to_string()),
             editor: Some("Microsoft Corporation".to_string()),
+            origen: None,
         },
     ];
 

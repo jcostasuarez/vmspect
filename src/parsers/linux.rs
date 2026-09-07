@@ -151,6 +151,7 @@ fn parsear_dpkg_status(contenido: &str, opciones: &Opciones) -> (Vec<Programa>, 
                     nombre: pkg.to_string(),
                     version: version_opt,
                     editor: editor_opt,
+                    origen: None,
                 });
             }
         }

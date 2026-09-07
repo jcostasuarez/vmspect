@@ -11,6 +11,12 @@ pub struct Programa {
     pub version: Option<String>,
     /// Editor o fabricante (Publisher / Maintainer / Section).
     pub editor: Option<String>,
+    /// Origen de la detección cuando no proviene del mecanismo principal de
+    /// extracción (Registro / gestor de paquetes). Por ejemplo, `"FallbackFS"`
+    /// cuando el programa se infirió escaneando `\Program Files` porque el
+    /// Registro de Windows resultó totalmente inaccesible.
+    #[serde(default)]
+    pub origen: Option<String>,
 }
 
 /// Contiene los metadatos detallados del sistema operativo detectado y sus componentes.
@@ -77,9 +83,11 @@ mod tests {
             nombre: "libssl3".to_string(),
             version: Some("3.0.2".to_string()),
             editor: Some("libs".to_string()),
+            origen: None,
         };
         assert_eq!(prog.nombre, "libssl3");
         assert_eq!(prog.version.as_deref(), Some("3.0.2"));
         assert_eq!(prog.editor.as_deref(), Some("libs"));
+        assert_eq!(prog.origen, None);
     }
 }

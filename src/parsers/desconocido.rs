@@ -22,6 +22,7 @@ impl InspectorOS for DesconocidoInspector {
                 VMInfo::default()
             },
             programas: Vec::new(),
+            advertencias: Vec::new(),
         })
     }
 }

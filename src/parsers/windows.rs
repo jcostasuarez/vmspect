@@ -21,6 +21,9 @@ const RUTA_CONFIG: [&str; 3] = ["Windows", "System32", "config"];
 struct Colmenas {
     software: Vec<u8>,
     system: Option<Vec<u8>>,
+    /// Advertencias no fatales generadas durante la extracción desde NTFS (ej. no
+    /// se pudo leer la colmena SYSTEM del disco pese a haberse solicitado).
+    advertencias: Vec<String>,
 }
 
 pub(crate) struct WindowsInspector;
@@ -39,25 +42,59 @@ impl InspectorOS for WindowsInspector {
 
         let candidatas: Vec<_> = particiones.iter().filter(|p| p.es_ntfs()).collect();
 
-        let particion = candidatas
+        let particion = match candidatas
             .iter()
             .find(|p| es_particion_sistema(driver, p.inicio, p.tamano, tamano_chunk))
-            .copied()
-            .ok_or_else(|| {
-                VmSpectError::WindowsRegistry(
-                    "Ninguna partición NTFS contiene Windows\\System32\\config".to_string(),
-                )
-            })?;
+        {
+            Some(p) => *p,
+            None => {
+                let msg = "Ninguna partición NTFS contiene Windows\\System32\\config (Registro inaccesible)".to_string();
+                tracing::warn!("{}", msg);
+                return Ok(resultado_degradado(msg));
+            }
+        };
 
-        let colmenas = extraer_colmenas_ntfs(
+        // `SYSTEM` solo se lee si el usuario lo solicitó explícitamente
+        // (`incluir_system`) y no desactivó el análisis de sistema (`--nosystem`).
+        let incluir_system = opciones.incluir_system && opciones.debe_analizar_sistema();
+
+        // Graceful Degradation: si la extracción de las colmenas desde el disco
+        // falla (bloques corruptos, colmena "sucia" tras un apagado abrupto, etc.)
+        // NO se aborta el pipeline de inspección: se registra la advertencia y se
+        // continúa con un resultado por defecto para el SO.
+        let colmenas = match extraer_colmenas_ntfs(
             driver,
             particion.inicio,
             particion.tamano,
             tamano_chunk,
-            opciones.incluir_system,
-        )?;
+            incluir_system,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!(
+                    "No se pudieron extraer las colmenas del Registro de Windows (Registro sucio / Inaccesible): {}",
+                    e
+                );
+                tracing::warn!("{}", msg);
+                return Ok(resultado_degradado(msg));
+            }
+        };
 
         analizar_colmenas(&colmenas, opciones)
+    }
+}
+
+/// Construye un [`ResultadoAnalisis`] de respaldo cuando el Registro de Windows no
+/// puede leerse o parsearse, preservando la advertencia para el informe final en
+/// lugar de abortar toda la inspección (Graceful Degradation).
+fn resultado_degradado(advertencia: String) -> ResultadoAnalisis {
+    ResultadoAnalisis {
+        vm_info: VMInfo {
+            os_nombre: "Windows (Registro sucio / Inaccesible)".to_string(),
+            ..VMInfo::default()
+        },
+        programas: Vec::new(),
+        advertencias: vec![advertencia],
     }
 }
 
@@ -95,15 +132,29 @@ fn extraer_colmenas_ntfs(
             VmSpectError::WindowsRegistry("No se encontró la colmena SOFTWARE".to_string())
         })?;
 
+    let mut advertencias = Vec::new();
     let system = if incluir_system {
-        leer_bytes_archivo(&ntfs, &mut disco, &config, "SYSTEM")
-            .ok()
-            .flatten()
+        match leer_bytes_archivo(&ntfs, &mut disco, &config, "SYSTEM") {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let msg = format!(
+                    "No se pudo leer la colmena SYSTEM del disco (Registro sucio / Inaccesible): {}",
+                    e
+                );
+                tracing::warn!("{}", msg);
+                advertencias.push(msg);
+                None
+            }
+        }
     } else {
         None
     };
 
-    Ok(Colmenas { software, system })
+    Ok(Colmenas {
+        software,
+        system,
+        advertencias,
+    })
 }
 
 fn es_particion_sistema(
@@ -203,25 +254,100 @@ fn leer_bytes_archivo(
 // -----------------------------------------------------------------------------
 
 fn analizar_colmenas(colmenas: &Colmenas, opciones: &Opciones) -> Result<ResultadoAnalisis> {
-    let hive_software = Hive::new(&colmenas.software[..])
-        .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
+    let mut advertencias = colmenas.advertencias.clone();
+    let mut registro_danado = false;
+
+    // Graceful Degradation: una colmena SOFTWARE corrupta o "sucia" (apagado
+    // abrupto de la VM, `SequenceNumberMismatch` entre los logs de transacciones,
+    // bloques dañados, etc.) puede hacer que el parser retorne un `Err` o, en
+    // casos extremos de corrupción, provocar un panic interno del crate
+    // `nt-hive`. Ambos escenarios se capturan (`match` + `catch_unwind`) para que
+    // NUNCA aborten el pipeline de inspección completo.
+    let bytes_software = &colmenas.software[..];
+    let (mut vm_info, programas) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            intentar_analizar_software(bytes_software, opciones)
+        })) {
+            Ok(Ok(datos)) => datos,
+            Ok(Err(e)) => {
+                let msg = format!(
+                    "Colmena SOFTWARE corrupta o inaccesible (Registro sucio): {}",
+                    e
+                );
+                tracing::warn!("{}", msg);
+                advertencias.push(msg);
+                registro_danado = true;
+                (VMInfo::default(), Vec::new())
+            }
+            Err(_panic) => {
+                let msg =
+                    "Colmena SOFTWARE gravemente dañada: el parser del Registro falló de forma \
+                       irrecuperable (Registro sucio)"
+                        .to_string();
+                tracing::warn!("{}", msg);
+                advertencias.push(msg);
+                registro_danado = true;
+                (VMInfo::default(), Vec::new())
+            }
+        };
+
+    if registro_danado {
+        vm_info.os_nombre = "Windows (Registro sucio / Inaccesible)".to_string();
+    }
+
+    if opciones.debe_analizar_sistema() && vm_info.vmtools_version.is_none() {
+        if let Some(system) = &colmenas.system {
+            let bytes_system = &system[..];
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                intentar_detectar_vmtools_en_system(bytes_system)
+            })) {
+                Ok(Ok(version)) => vm_info.vmtools_version = version,
+                Ok(Err(e)) => {
+                    let msg = format!(
+                        "Colmena SYSTEM corrupta o inaccesible (Registro sucio): {}",
+                        e
+                    );
+                    tracing::warn!("{}", msg);
+                    advertencias.push(msg);
+                }
+                Err(_panic) => {
+                    let msg = "Colmena SYSTEM gravemente dañada: el parser del Registro falló de \
+                               forma irrecuperable (Registro sucio)"
+                        .to_string();
+                    tracing::warn!("{}", msg);
+                    advertencias.push(msg);
+                }
+            }
+        }
+    }
+
+    Ok(ResultadoAnalisis {
+        vm_info,
+        programas,
+        advertencias,
+    })
+}
+
+/// Intenta parsear la colmena SOFTWARE y extraer la información del SO y la
+/// lista de programas instalados. Devuelve `Err` si la colmena está corrupta o
+/// no puede parsearse (colmena "sucia"); nunca contiene panics propios más allá
+/// de los que pueda producir el crate `nt-hive` (capturados por el llamador con
+/// `catch_unwind`).
+fn intentar_analizar_software(
+    bytes: &[u8],
+    opciones: &Opciones,
+) -> Result<(VMInfo, Vec<Programa>)> {
+    let hive_software =
+        Hive::new(bytes).map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
     let root_software = hive_software
         .root_key_node()
         .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
 
-    let mut vm_info = if opciones.debe_analizar_sistema() {
+    let vm_info = if opciones.debe_analizar_sistema() {
         extraer_informacion_vm(&root_software)
     } else {
         VMInfo::default()
     };
-
-    if opciones.debe_analizar_sistema() {
-        if let Some(system) = &colmenas.system {
-            if vm_info.vmtools_version.is_none() {
-                vm_info.vmtools_version = detectar_servicio_vmtools_en_system(&system[..]);
-            }
-        }
-    }
 
     let programas = if opciones.debe_analizar_apps() {
         buscar_programas_en_registro(&root_software, opciones)
@@ -229,32 +355,38 @@ fn analizar_colmenas(colmenas: &Colmenas, opciones: &Opciones) -> Result<Resulta
         Vec::new()
     };
 
-    Ok(ResultadoAnalisis { vm_info, programas })
+    Ok((vm_info, programas))
 }
 
-fn detectar_servicio_vmtools_en_system(mmap_system: &[u8]) -> Option<String> {
-    if let Ok(hive_system) = Hive::new(mmap_system) {
-        if let Ok(root_system) = hive_system.root_key_node() {
-            let rutas_servicio = [
-                "ControlSet001\\Services\\VMTools",
-                "ControlSet002\\Services\\VMTools",
-                "CurrentControlSet\\Services\\VMTools",
-            ];
+/// Intenta parsear la colmena SYSTEM y detectar la versión de VMware Tools a
+/// través del servicio `VMTools`. Devuelve `Err` si la colmena está corrupta o
+/// no puede parsearse (colmena "sucia").
+fn intentar_detectar_vmtools_en_system(mmap_system: &[u8]) -> Result<Option<String>> {
+    let hive_system =
+        Hive::new(mmap_system).map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
+    let root_system = hive_system
+        .root_key_node()
+        .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
 
-            for ruta in &rutas_servicio {
-                if let Ok(Some(nodo_servicio)) = buscar_clave_por_ruta(&root_system, ruta) {
-                    if let Some(image_path) = leer_valor_de_clave(&nodo_servicio, "ImagePath") {
-                        if let Some(ver) = leer_valor_de_clave(&nodo_servicio, "Version") {
-                            return Some(format!("{} (Servicio: {})", ver, image_path));
-                        }
-                        return Some(format!("Detectado por Servicio ({})", image_path));
-                    }
-                    return Some("Detectado por Servicio Windows (VMTools)".to_string());
+    let rutas_servicio = [
+        "ControlSet001\\Services\\VMTools",
+        "ControlSet002\\Services\\VMTools",
+        "CurrentControlSet\\Services\\VMTools",
+    ];
+
+    for ruta in &rutas_servicio {
+        if let Ok(Some(nodo_servicio)) = buscar_clave_por_ruta(&root_system, ruta) {
+            if let Some(image_path) = leer_valor_de_clave(&nodo_servicio, "ImagePath") {
+                if let Some(ver) = leer_valor_de_clave(&nodo_servicio, "Version") {
+                    return Ok(Some(format!("{} (Servicio: {})", ver, image_path)));
                 }
+                return Ok(Some(format!("Detectado por Servicio ({})", image_path)));
             }
+            return Ok(Some("Detectado por Servicio Windows (VMTools)".to_string()));
         }
     }
-    None
+
+    Ok(None)
 }
 
 fn extraer_version_vmtools(root_node: &HiveKeyNode) -> Option<String> {
@@ -503,6 +635,7 @@ fn convertir_valor_a_string(val: &KeyValue<&[u8]>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::SistemaArchivos;
 
     #[test]
     fn test_es_clave_vmware_tools() {
@@ -512,5 +645,75 @@ mod tests {
             editor: Some("VMware, Inc.".to_string()),
         };
         assert!(p.nombre.to_lowercase().contains("vmware tools"));
+    }
+
+    /// Simula un error de lectura/parseo de Registro (colmena "sucia" o corrupta,
+    /// ej. `SequenceNumberMismatch`) y verifica que el análisis se degrada con
+    /// gracia: retorna `Ok`, agrega la advertencia y usa un nombre de SO fallback,
+    /// en lugar de abortar el pipeline con un `Err`.
+    #[test]
+    fn test_analizar_colmenas_registro_sucio_retorna_ok() {
+        let colmenas = Colmenas {
+            software: vec![0u8; 4096],
+            system: Some(vec![0u8; 4096]),
+            advertencias: Vec::new(),
+        };
+        let opciones = Opciones::default();
+
+        let resultado = analizar_colmenas(&colmenas, &opciones);
+
+        assert!(resultado.is_ok());
+        let resultado = resultado.unwrap();
+        assert!(!resultado.advertencias.is_empty());
+        assert_eq!(
+            resultado.vm_info.os_nombre,
+            "Windows (Registro sucio / Inaccesible)"
+        );
+        assert!(resultado.programas.is_empty());
+    }
+
+    /// Verifica el mismo escenario a nivel del trait `InspectorOS` completo: si el
+    /// disco/partición no permite acceder al Registro (NTFS ilegible o ausente),
+    /// `WindowsInspector::analizar` debe retornar `Ok` con datos de respaldo en
+    /// lugar de abortar toda la inspección.
+    #[test]
+    fn test_windows_inspector_analizar_registro_inaccesible_retorna_ok() {
+        struct MockDriverSucio;
+        impl VmDriver for MockDriverSucio {
+            fn tamano_virtual(&self) -> u64 {
+                16 * 1024 * 1024
+            }
+            fn leer_rango(&self, _offset: u64, buf: &mut [u8]) -> Result<()> {
+                buf.fill(0);
+                Ok(())
+            }
+            fn modo_acceso(&self) -> &str {
+                "mock"
+            }
+            fn es_nativo(&self) -> bool {
+                true
+            }
+        }
+
+        let inspector = WindowsInspector;
+        let particiones = vec![Particion {
+            indice: 0,
+            inicio: 0,
+            tamano: 16 * 1024 * 1024,
+            tipo: "0x07".to_string(),
+            sistema_archivos: SistemaArchivos::Ntfs,
+            etiqueta: None,
+        }];
+        let opciones = Opciones::default();
+
+        let resultado = inspector.analizar(&MockDriverSucio, &particiones, 4096, &opciones);
+
+        assert!(resultado.is_ok());
+        let resultado = resultado.unwrap();
+        assert!(!resultado.advertencias.is_empty());
+        assert_eq!(
+            resultado.vm_info.os_nombre,
+            "Windows (Registro sucio / Inaccesible)"
+        );
     }
 }

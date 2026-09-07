@@ -59,6 +59,7 @@ impl InspectorOS for LinuxInspector {
                 VMInfo::default()
             },
             programas: Vec::new(),
+            advertencias: Vec::new(),
         })
     }
 }
@@ -103,7 +104,11 @@ fn analizar_sistema_archivos<R: ReadAt>(
         programas.dedup_by(|a, b| a.nombre == b.nombre && a.version == b.version);
     }
 
-    Ok(ResultadoAnalisis { vm_info, programas })
+    Ok(ResultadoAnalisis {
+        vm_info,
+        programas,
+        advertencias: Vec::new(),
+    })
 }
 
 fn parsear_dpkg_status(contenido: &str, opciones: &Opciones) -> (Vec<Programa>, Option<String>) {

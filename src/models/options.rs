@@ -397,6 +397,11 @@ pub struct InformeInspeccion {
     pub vm_info: VMInfo,
     /// Lista de programas estructurados hallados en el sistema (Nombre, Versión, Editor).
     pub programas: Vec<Programa>,
+    /// Advertencias no fatales recopiladas durante la inspección (ej. Registro de
+    /// Windows dañado o "sucio" del que se degradó con gracia el análisis, sin
+    /// abortar el resto del pipeline).
+    #[serde(default)]
+    pub advertencias: Vec<String>,
     /// Métricas de rendimiento asociadas a la inspección.
     pub estadisticas: Estadisticas,
 }

@@ -11,6 +11,9 @@ pub struct ResultadoAnalisis {
     pub vm_info: VMInfo,
     /// Lista de programas y paquetes identificados.
     pub programas: Vec<Programa>,
+    /// Advertencias no fatales recolectadas durante el análisis (ej. colmenas del
+    /// Registro de Windows corruptas o "sucias" de las que se degradó con gracia).
+    pub advertencias: Vec<String>,
 }
 
 /// Contrato abstracto para drivers de acceso a imágenes de máquinas virtuales o hipervisores.

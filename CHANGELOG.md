@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.3.3] - 2026-09-06
+
+### Changed
+- Bumped the install snippet in `readme.md` to reference the current `0.3.3` release (was previously pinned to `0.3.0`).
+
 ## [0.3.2] - 2026-09-06
 
 ### Fixed

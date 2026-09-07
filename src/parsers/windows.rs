@@ -11,16 +11,28 @@ use crate::error::{Result, VmSpectError};
 use crate::models::traits::{InspectorOS, ResultadoAnalisis, VmDriver};
 use crate::models::{Opciones, Particion, Programa, VMInfo};
 use crate::vms::stream::DiscoVirtual;
-use nt_hive::{Hive, KeyNode, KeyValue};
+use nt_hive::{Hive, KeyNode, KeyValue, NtHiveError};
 use ntfs::indexes::NtfsFileNameIndex;
+use ntfs::structured_values::NtfsFileNamespace;
 use ntfs::{Ntfs, NtfsFile};
 use std::io::Read;
 
 const RUTA_CONFIG: [&str; 3] = ["Windows", "System32", "config"];
+/// Carpetas de nivel superior donde el fallback NTFS busca software instalado
+/// cuando el Registro es totalmente inaccesible.
+const CARPETAS_PROGRAM_FILES: [&str; 2] = ["Program Files", "Program Files (x86)"];
+/// Marca de origen asignada a los programas inferidos por el fallback NTFS.
+const ORIGEN_FALLBACK_FS: &str = "FallbackFS";
 
 struct Colmenas {
     software: Vec<u8>,
     system: Option<Vec<u8>>,
+    /// `true` si se halló al menos uno de los archivos de transacción
+    /// `SOFTWARE.LOG1` / `SOFTWARE.LOG2` junto a la colmena primaria.
+    software_logs_presentes: bool,
+    /// `true` si se halló al menos uno de los archivos de transacción
+    /// `SYSTEM.LOG1` / `SYSTEM.LOG2` junto a la colmena primaria.
+    system_logs_presentes: bool,
     /// Advertencias no fatales generadas durante la extracción desde NTFS (ej. no
     /// se pudo leer la colmena SYSTEM del disco pese a haberse solicitado).
     advertencias: Vec<String>,
@@ -80,7 +92,26 @@ impl InspectorOS for WindowsInspector {
             }
         };
 
-        analizar_colmenas(&colmenas, opciones)
+        let (mut resultado, requiere_fallback_fs) = analizar_colmenas(&colmenas, opciones)?;
+
+        // Fallback FS: si la colmena SOFTWARE resultó totalmente inaccesible (ni
+        // siquiera en modo permisivo pudo recuperarse su árbol de claves), se
+        // recurre a inspeccionar directamente el sistema de archivos NTFS para
+        // no devolver 0 programas ni un nombre de SO genérico.
+        if requiere_fallback_fs {
+            let (vm_info_fs, programas_fs, advertencias_fs) =
+                aplicar_fallback_fs(driver, particion, tamano_chunk, opciones);
+
+            if let Some(info_fs) = vm_info_fs {
+                resultado.vm_info = info_fs;
+            }
+            if !programas_fs.is_empty() {
+                resultado.programas.extend(programas_fs);
+            }
+            resultado.advertencias.extend(advertencias_fs);
+        }
+
+        Ok(resultado)
     }
 }
 
@@ -132,8 +163,18 @@ fn extraer_colmenas_ntfs(
             VmSpectError::WindowsRegistry("No se encontró la colmena SOFTWARE".to_string())
         })?;
 
+    // Soporte de archivos de log transaccional (.LOG1/.LOG2): su presencia se
+    // usa como señal para decidir la estrategia de recuperación y para
+    // enriquecer los mensajes de advertencia, ya que indican que la colmena
+    // pudo quedar "sucia" tras un apagado abrupto sin sincronizar sus cambios.
+    let software_logs_presentes = existe_archivo(&ntfs, &mut disco, &config, "SOFTWARE.LOG1")
+        || existe_archivo(&ntfs, &mut disco, &config, "SOFTWARE.LOG2");
+
     let mut advertencias = Vec::new();
+    let mut system_logs_presentes = false;
     let system = if incluir_system {
+        system_logs_presentes = existe_archivo(&ntfs, &mut disco, &config, "SYSTEM.LOG1")
+            || existe_archivo(&ntfs, &mut disco, &config, "SYSTEM.LOG2");
         match leer_bytes_archivo(&ntfs, &mut disco, &config, "SYSTEM") {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -153,6 +194,8 @@ fn extraer_colmenas_ntfs(
     Ok(Colmenas {
         software,
         system,
+        software_logs_presentes,
+        system_logs_presentes,
         advertencias,
     })
 }
@@ -249,26 +292,106 @@ fn leer_bytes_archivo(
     Ok(Some(datos))
 }
 
+/// Comprueba de forma barata si un archivo existe dentro de un directorio NTFS,
+/// sin leer su contenido. Se usa para detectar la presencia de los archivos de
+/// transacción `.LOG1`/`.LOG2` junto a una colmena del Registro.
+fn existe_archivo(
+    ntfs: &Ntfs,
+    disco: &mut DiscoVirtual<'_>,
+    directorio: &NtfsFile<'_>,
+    nombre: &str,
+) -> bool {
+    let Ok(indice) = directorio.directory_index(disco) else {
+        return false;
+    };
+    let mut finder = indice.finder();
+    matches!(
+        NtfsFileNameIndex::find(&mut finder, ntfs, disco, nombre),
+        Some(Ok(_))
+    )
+}
+
+/// Lee, como máximo, los primeros `max_bytes` bytes del flujo de datos
+/// principal de un archivo NTFS. Se usa en el fallback por sistema de archivos
+/// para inspeccionar el encabezado PE de binarios grandes (ej. `ntoskrnl.exe`)
+/// sin tener que volcar el ejecutable completo a memoria.
+fn leer_prefijo_archivo(
+    ntfs: &Ntfs,
+    disco: &mut DiscoVirtual<'_>,
+    directorio: &NtfsFile<'_>,
+    nombre: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
+    let indice = directorio
+        .directory_index(disco)
+        .map_err(|e| VmSpectError::FileSystem(format!("{:?}", e)))?;
+    let mut finder = indice.finder();
+    let Some(entrada) = NtfsFileNameIndex::find(&mut finder, ntfs, disco, nombre) else {
+        return Ok(None);
+    };
+    let archivo = entrada
+        .map_err(|e| VmSpectError::FileSystem(format!("{:?}", e)))?
+        .to_file(ntfs, disco)
+        .map_err(|e| VmSpectError::FileSystem(format!("{:?}", e)))?;
+
+    let item = archivo
+        .data(disco, "")
+        .ok_or_else(|| {
+            VmSpectError::FileSystem(format!(
+                "El archivo {} no tiene flujo de datos principal",
+                nombre
+            ))
+        })?
+        .map_err(|e| VmSpectError::FileSystem(format!("{:?}", e)))?;
+    let atributo = item
+        .to_attribute()
+        .map_err(|e| VmSpectError::FileSystem(format!("{:?}", e)))?;
+    let valor = atributo
+        .value(disco)
+        .map_err(|e| VmSpectError::FileSystem(format!("{:?}", e)))?;
+
+    let mut lector = valor.attach(disco).take(max_bytes);
+    let mut datos = Vec::new();
+    lector.read_to_end(&mut datos).map_err(VmSpectError::Io)?;
+    Ok(Some(datos))
+}
+
 // -----------------------------------------------------------------------------
 // 2. PARSEO Y EXTRACCIÓN DE DATOS DEL REGISTRO
 // -----------------------------------------------------------------------------
 
-fn analizar_colmenas(colmenas: &Colmenas, opciones: &Opciones) -> Result<ResultadoAnalisis> {
+/// Analiza las colmenas ya extraídas del disco. Devuelve el resultado junto a
+/// un booleano `requiere_fallback_fs` que indica si la colmena SOFTWARE resultó
+/// totalmente inaccesible (ni con validación completa ni en modo permisivo), lo
+/// que le indica al llamador que debe recurrir al fallback por sistema de
+/// archivos NTFS para no devolver 0 programas y un nombre de SO genérico.
+fn analizar_colmenas(
+    colmenas: &Colmenas,
+    opciones: &Opciones,
+) -> Result<(ResultadoAnalisis, bool)> {
     let mut advertencias = colmenas.advertencias.clone();
-    let mut registro_danado = false;
+    let mut requiere_fallback_fs = false;
 
     // Graceful Degradation: una colmena SOFTWARE corrupta o "sucia" (apagado
     // abrupto de la VM, `SequenceNumberMismatch` entre los logs de transacciones,
     // bloques dañados, etc.) puede hacer que el parser retorne un `Err` o, en
     // casos extremos de corrupción, provocar un panic interno del crate
     // `nt-hive`. Ambos escenarios se capturan (`match` + `catch_unwind`) para que
-    // NUNCA aborten el pipeline de inspección completo.
+    // NUNCA aborten el pipeline de inspección completo. Antes de rendirse, se
+    // intenta una recuperación permisiva (ver `abrir_hive_con_recuperacion`).
     let bytes_software = &colmenas.software[..];
+    let logs_software = colmenas.software_logs_presentes;
     let (mut vm_info, programas) =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            intentar_analizar_software(bytes_software, opciones)
+            intentar_analizar_software(bytes_software, opciones, logs_software)
         })) {
-            Ok(Ok(datos)) => datos,
+            Ok(Ok((info, progs, aviso_recuperacion))) => {
+                if let Some(msg) = aviso_recuperacion {
+                    tracing::warn!("{}", msg);
+                    advertencias.push(msg);
+                }
+                (info, progs)
+            }
             Ok(Err(e)) => {
                 let msg = format!(
                     "Colmena SOFTWARE corrupta o inaccesible (Registro sucio): {}",
@@ -276,7 +399,7 @@ fn analizar_colmenas(colmenas: &Colmenas, opciones: &Opciones) -> Result<Resulta
                 );
                 tracing::warn!("{}", msg);
                 advertencias.push(msg);
-                registro_danado = true;
+                requiere_fallback_fs = true;
                 (VMInfo::default(), Vec::new())
             }
             Err(_panic) => {
@@ -286,22 +409,29 @@ fn analizar_colmenas(colmenas: &Colmenas, opciones: &Opciones) -> Result<Resulta
                         .to_string();
                 tracing::warn!("{}", msg);
                 advertencias.push(msg);
-                registro_danado = true;
+                requiere_fallback_fs = true;
                 (VMInfo::default(), Vec::new())
             }
         };
 
-    if registro_danado {
+    if requiere_fallback_fs {
         vm_info.os_nombre = "Windows (Registro sucio / Inaccesible)".to_string();
     }
 
     if opciones.debe_analizar_sistema() && vm_info.vmtools_version.is_none() {
         if let Some(system) = &colmenas.system {
             let bytes_system = &system[..];
+            let logs_system = colmenas.system_logs_presentes;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                intentar_detectar_vmtools_en_system(bytes_system)
+                intentar_detectar_vmtools_en_system(bytes_system, logs_system)
             })) {
-                Ok(Ok(version)) => vm_info.vmtools_version = version,
+                Ok(Ok((version, aviso_recuperacion))) => {
+                    vm_info.vmtools_version = version;
+                    if let Some(msg) = aviso_recuperacion {
+                        tracing::warn!("{}", msg);
+                        advertencias.push(msg);
+                    }
+                }
                 Ok(Err(e)) => {
                     let msg = format!(
                         "Colmena SYSTEM corrupta o inaccesible (Registro sucio): {}",
@@ -321,14 +451,56 @@ fn analizar_colmenas(colmenas: &Colmenas, opciones: &Opciones) -> Result<Resulta
         }
     }
 
-    Ok(ResultadoAnalisis {
-        vm_info,
-        programas,
-        advertencias,
-    })
+    Ok((
+        ResultadoAnalisis {
+            vm_info,
+            programas,
+            advertencias,
+        },
+        requiere_fallback_fs,
+    ))
 }
 
-/// Intenta parsear la colmena SOFTWARE y extraer la información del SO y la
+/// Intenta abrir una colmena del Registro aplicando una estrategia de
+/// recuperación en cascada:
+/// 1. Apertura estándar con validación completa del encabezado (`Hive::new`).
+/// 2. Si falla (ej. `SequenceNumberMismatch` por una colmena "sucia" tras un
+///    apagado abrupto sin sincronizar sus archivos de transacción
+///    `.LOG1`/`.LOG2`), reintenta en **modo permisivo**
+///    (`Hive::without_validation`), que omite la validación del encabezado y
+///    permite recorrer las claves que permanezcan intactas en el archivo
+///    primario. `nt-hive` no soporta repetir ("replay") el contenido de los
+///    archivos `.LOG1`/`.LOG2`, por lo que su presencia solo se usa aquí para
+///    enriquecer el mensaje de advertencia devuelto.
+fn abrir_hive_con_recuperacion(
+    bytes: &[u8],
+    logs_transaccionales_presentes: bool,
+) -> std::result::Result<(Hive<&[u8]>, Option<String>), NtHiveError> {
+    match Hive::new(bytes) {
+        Ok(hive) => Ok((hive, None)),
+        Err(error_original) => {
+            // Puede seguir fallando (ej. datos totalmente corruptos/ilegibles):
+            // en ese caso el `?` propaga el error y el llamador activa el
+            // fallback por sistema de archivos.
+            let hive = Hive::without_validation(bytes)?;
+
+            let contexto_logs = if logs_transaccionales_presentes {
+                "se detectaron archivos de transaccion .LOG1/.LOG2 junto a la colmena, pero el parser del Registro (nt-hive) no soporta repetir su contenido"
+            } else {
+                "no se hallaron archivos de transaccion .LOG1/.LOG2 junto a la colmena para intentar reproducir sus cambios pendientes"
+            };
+
+            let mensaje = format!(
+                "Colmena con encabezado danado/sucio ({:?}): {}; se activo el modo permisivo de lectura (sin validar el encabezado) para recuperar las claves que permanezcan intactas en el archivo primario",
+                error_original, contexto_logs
+            );
+
+            Ok((hive, Some(mensaje)))
+        }
+    }
+}
+
+/// Intenta parsear la colmena SOFTWARE y extraer la informacion del SO y la
 /// lista de programas instalados. Devuelve `Err` si la colmena está corrupta o
 /// no puede parsearse (colmena "sucia"); nunca contiene panics propios más allá
 /// de los que pueda producir el crate `nt-hive` (capturados por el llamador con
@@ -336,9 +508,11 @@ fn analizar_colmenas(colmenas: &Colmenas, opciones: &Opciones) -> Result<Resulta
 fn intentar_analizar_software(
     bytes: &[u8],
     opciones: &Opciones,
-) -> Result<(VMInfo, Vec<Programa>)> {
-    let hive_software =
-        Hive::new(bytes).map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
+    logs_transaccionales_presentes: bool,
+) -> Result<(VMInfo, Vec<Programa>, Option<String>)> {
+    let (hive_software, aviso_recuperacion) =
+        abrir_hive_con_recuperacion(bytes, logs_transaccionales_presentes)
+            .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
     let root_software = hive_software
         .root_key_node()
         .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
@@ -355,15 +529,19 @@ fn intentar_analizar_software(
         Vec::new()
     };
 
-    Ok((vm_info, programas))
+    Ok((vm_info, programas, aviso_recuperacion))
 }
 
 /// Intenta parsear la colmena SYSTEM y detectar la versión de VMware Tools a
 /// través del servicio `VMTools`. Devuelve `Err` si la colmena está corrupta o
 /// no puede parsearse (colmena "sucia").
-fn intentar_detectar_vmtools_en_system(mmap_system: &[u8]) -> Result<Option<String>> {
-    let hive_system =
-        Hive::new(mmap_system).map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
+fn intentar_detectar_vmtools_en_system(
+    mmap_system: &[u8],
+    logs_transaccionales_presentes: bool,
+) -> Result<(Option<String>, Option<String>)> {
+    let (hive_system, aviso_recuperacion) =
+        abrir_hive_con_recuperacion(mmap_system, logs_transaccionales_presentes)
+            .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
     let root_system = hive_system
         .root_key_node()
         .map_err(|e| VmSpectError::WindowsRegistry(format!("{:?}", e)))?;
@@ -378,15 +556,24 @@ fn intentar_detectar_vmtools_en_system(mmap_system: &[u8]) -> Result<Option<Stri
         if let Ok(Some(nodo_servicio)) = buscar_clave_por_ruta(&root_system, ruta) {
             if let Some(image_path) = leer_valor_de_clave(&nodo_servicio, "ImagePath") {
                 if let Some(ver) = leer_valor_de_clave(&nodo_servicio, "Version") {
-                    return Ok(Some(format!("{} (Servicio: {})", ver, image_path)));
+                    return Ok((
+                        Some(format!("{} (Servicio: {})", ver, image_path)),
+                        aviso_recuperacion,
+                    ));
                 }
-                return Ok(Some(format!("Detectado por Servicio ({})", image_path)));
+                return Ok((
+                    Some(format!("Detectado por Servicio ({})", image_path)),
+                    aviso_recuperacion,
+                ));
             }
-            return Ok(Some("Detectado por Servicio Windows (VMTools)".to_string()));
+            return Ok((
+                Some("Detectado por Servicio Windows (VMTools)".to_string()),
+                aviso_recuperacion,
+            ));
         }
     }
 
-    Ok(None)
+    Ok((None, aviso_recuperacion))
 }
 
 fn extraer_version_vmtools(root_node: &HiveKeyNode) -> Option<String> {
@@ -597,6 +784,7 @@ fn extraer_programas_de_subclaves(
                     nombre: nombre_prog,
                     version: version_opt,
                     editor: editor_opt,
+                    origen: None,
                 });
             }
         }
@@ -632,6 +820,243 @@ fn convertir_valor_a_string(val: &KeyValue<&[u8]>) -> Option<String> {
     None
 }
 
+// -----------------------------------------------------------------------------
+// 5. FALLBACK POR SISTEMA DE ARCHIVOS NTFS (Registro totalmente inaccesible)
+// -----------------------------------------------------------------------------
+
+/// Ultimo recurso cuando la colmena SOFTWARE resulto totalmente inaccesible (ni
+/// con validacion completa ni en modo permisivo pudo recuperarse su arbol de
+/// claves): inspecciona directamente el sistema de archivos NTFS para no
+/// devolver 0 programas instalados ni un nombre de SO generico.
+///
+/// Estrategia: 1) determina una version/build aproximada del SO leyendo el
+/// encabezado PE de `\Windows\System32\ntoskrnl.exe` (o, en su defecto, solo
+/// confirma que se trata de un Windows mediante la presencia de
+/// `\Windows\System32\license.rtf`); 2) enumera las carpetas de primer nivel
+/// dentro de `\Program Files` y `\Program Files (x86)` y las convierte en
+/// entradas de software marcadas con `origen: FallbackFS`.
+fn aplicar_fallback_fs(
+    driver: &dyn VmDriver,
+    particion: &Particion,
+    tamano_chunk: u64,
+    opciones: &Opciones,
+) -> (Option<VMInfo>, Vec<Programa>, Vec<String>) {
+    let mut advertencias = Vec::new();
+    let mut disco = DiscoVirtual::new(driver, particion.inicio, particion.tamano, tamano_chunk);
+
+    let mut ntfs = match Ntfs::new(&mut disco) {
+        Ok(n) => n,
+        Err(e) => {
+            advertencias.push(format!(
+                "FallbackFS: no se pudo volver a montar la particion NTFS ({:?})",
+                e
+            ));
+            return (None, Vec::new(), advertencias);
+        }
+    };
+    if let Err(e) = ntfs.read_upcase_table(&mut disco) {
+        advertencias.push(format!(
+            "FallbackFS: no se pudo leer la tabla UpCase de NTFS ({:?})",
+            e
+        ));
+        return (None, Vec::new(), advertencias);
+    }
+    let raiz = match ntfs.root_directory(&mut disco) {
+        Ok(r) => r,
+        Err(e) => {
+            advertencias.push(format!(
+                "FallbackFS: no se pudo acceder al directorio raiz de NTFS ({:?})",
+                e
+            ));
+            return (None, Vec::new(), advertencias);
+        }
+    };
+
+    let mut vm_info = None;
+    if opciones.debe_analizar_sistema() {
+        match navegar_directorio(&ntfs, &mut disco, raiz.clone(), &["Windows", "System32"]) {
+            Ok(Some(system32)) => match detectar_so_por_binarios(&ntfs, &mut disco, &system32) {
+                Some((info, msg)) => {
+                    advertencias.push(msg);
+                    vm_info = Some(info);
+                }
+                None => advertencias.push(
+                    "FallbackFS: no se pudo determinar la version del SO (ni ntoskrnl.exe ni license.rtf fueron legibles en \\Windows\\System32)".to_string(),
+                ),
+            },
+            _ => advertencias.push(
+                "FallbackFS: no se encontro \\Windows\\System32 en la particion NTFS".to_string(),
+            ),
+        }
+    }
+
+    let mut programas = Vec::new();
+    if opciones.debe_analizar_apps() {
+        for carpeta in CARPETAS_PROGRAM_FILES {
+            if let Some(cancel) = &opciones.cancel_token {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+            if let Ok(Some(dir)) = navegar_directorio(&ntfs, &mut disco, raiz.clone(), &[carpeta]) {
+                escanear_carpetas_como_programas(&mut disco, &dir, opciones, &mut programas);
+            }
+        }
+
+        if !programas.is_empty() {
+            advertencias.push(format!(
+                "FallbackFS: se recuperaron {} entradas de software escaneando las carpetas de \\Program Files (sin version/editor; origen {}) porque el Registro es inaccesible",
+                programas.len(),
+                ORIGEN_FALLBACK_FS
+            ));
+        }
+    }
+
+    (vm_info, programas, advertencias)
+}
+
+/// Determina una version/build aproximada del SO a partir de binarios del
+/// sistema, sin depender del Registro. Devuelve la informacion junto al
+/// mensaje de advertencia que describe como se obtuvo.
+fn detectar_so_por_binarios(
+    ntfs: &Ntfs,
+    disco: &mut DiscoVirtual<'_>,
+    system32: &NtfsFile<'_>,
+) -> Option<(VMInfo, String)> {
+    if let Ok(Some(bytes)) = leer_prefijo_archivo(ntfs, disco, system32, "ntoskrnl.exe", 8192) {
+        if let Some(timestamp) = extraer_timestamp_pe(&bytes) {
+            let fecha = fecha_desde_epoch(timestamp);
+            let info = VMInfo {
+                os_nombre: format!("Windows (version aproximada por {})", ORIGEN_FALLBACK_FS),
+                os_build: format!(
+                    "Aproximado por fecha de compilacion PE de ntoskrnl.exe: {}",
+                    fecha
+                ),
+                ..VMInfo::default()
+            };
+            let msg = format!(
+                "Registro totalmente inaccesible: se determino una version aproximada del SO mediante el timestamp PE de \\Windows\\System32\\ntoskrnl.exe ({})",
+                ORIGEN_FALLBACK_FS
+            );
+            return Some((info, msg));
+        }
+    }
+
+    if existe_archivo(ntfs, disco, system32, "license.rtf") {
+        let info = VMInfo {
+            os_nombre: format!(
+                "Windows (detectado por {}: license.rtf)",
+                ORIGEN_FALLBACK_FS
+            ),
+            ..VMInfo::default()
+        };
+        let msg = format!(
+            "Registro totalmente inaccesible: no se pudo leer ntoskrnl.exe, pero se confirmo un sistema Windows mediante la presencia de \\Windows\\System32\\license.rtf ({})",
+            ORIGEN_FALLBACK_FS
+        );
+        return Some((info, msg));
+    }
+
+    None
+}
+
+/// Enumera las subcarpetas de primer nivel de un directorio NTFS (ej.
+/// `\Program Files`) y las agrega a `salida` como entradas de software con
+/// origen `FallbackFS`, ya que solo se conoce el nombre de la carpeta (no hay
+/// version ni editor disponibles sin el Registro).
+fn escanear_carpetas_como_programas(
+    disco: &mut DiscoVirtual<'_>,
+    directorio: &NtfsFile<'_>,
+    opciones: &Opciones,
+    salida: &mut Vec<Programa>,
+) {
+    let Ok(indice) = directorio.directory_index(disco) else {
+        return;
+    };
+    let mut vistos = std::collections::HashSet::new();
+    let mut entradas = indice.entries();
+    loop {
+        if let Some(cancel) = &opciones.cancel_token {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+        }
+        let Some(entrada) = entradas.next(disco) else {
+            break;
+        };
+        let Ok(entrada) = entrada else {
+            continue;
+        };
+        let Some(Ok(nombre_key)) = entrada.key() else {
+            continue;
+        };
+        if !nombre_key.is_directory() {
+            continue;
+        }
+        if nombre_key.namespace() == NtfsFileNamespace::Dos {
+            // Se evitan los nombres cortos 8.3, que duplicarian la carpeta
+            // Win32 ya reportada bajo su nombre largo.
+            continue;
+        }
+        let nombre = nombre_key.name().to_string_lossy();
+        if nombre == "." || nombre == ".." {
+            continue;
+        }
+        if !vistos.insert(nombre.clone()) {
+            continue;
+        }
+        salida.push(Programa {
+            nombre,
+            version: None,
+            editor: None,
+            origen: Some(ORIGEN_FALLBACK_FS.to_string()),
+        });
+    }
+}
+
+/// Extrae el `TimeDateStamp` (segundos Unix de compilacion) del encabezado PE
+/// de un ejecutable/DLL a partir de sus primeros bytes, sin necesitar el
+/// archivo completo.
+fn extraer_timestamp_pe(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return None;
+    }
+    let e_lfanew = u32::from_le_bytes(bytes.get(0x3C..0x40)?.try_into().ok()?) as usize;
+    let fin_firma = e_lfanew.checked_add(4)?;
+    let fin_timestamp = fin_firma.checked_add(8)?;
+    if bytes.len() < fin_timestamp || &bytes[e_lfanew..fin_firma] != b"PE\0\0" {
+        return None;
+    }
+    let inicio_timestamp = fin_firma.checked_add(4)?;
+    let timestamp = u32::from_le_bytes(bytes[inicio_timestamp..fin_timestamp].try_into().ok()?);
+    Some(timestamp)
+}
+
+/// Formatea un timestamp Unix (segundos) como fecha `AAAA-MM-DD`, sin
+/// depender de crates externos de fecha/hora.
+fn fecha_desde_epoch(segundos_epoch: u32) -> String {
+    let dias_totales = (segundos_epoch as i64) / 86400;
+    let (anio, mes, dia) = civil_desde_dias(dias_totales);
+    format!("{:04}-{:02}-{:02}", anio, mes, dia)
+}
+
+/// Algoritmo de Howard Hinnant para convertir un numero de dias desde la
+/// epoca Unix (1970-01-01) a una fecha del calendario gregoriano (anio, mes,
+/// dia). Referencia: http://howardhinnant.github.io/date_algorithms.html
+fn civil_desde_dias(dias_desde_epoch: i64) -> (i64, u32, u32) {
+    let z = dias_desde_epoch + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,8 +1068,59 @@ mod tests {
             nombre: "VMware Tools".to_string(),
             version: Some("12.4.5".to_string()),
             editor: Some("VMware, Inc.".to_string()),
+            origen: None,
         };
         assert!(p.nombre.to_lowercase().contains("vmware tools"));
+    }
+
+    /// Verifica el algoritmo de conversion de dias-desde-epoca a fecha civil
+    /// (usado por el fallback FS para aproximar la version del SO a partir del
+    /// timestamp PE de `ntoskrnl.exe`) contra fechas conocidas.
+    #[test]
+    fn test_fecha_desde_epoch_fechas_conocidas() {
+        assert_eq!(fecha_desde_epoch(0), "1970-01-01");
+        // 2021-04-02T00:00:00Z
+        assert_eq!(fecha_desde_epoch(1_617_321_600), "2021-04-02");
+        // 2000-01-01T00:00:00Z
+        assert_eq!(fecha_desde_epoch(946_684_800), "2000-01-01");
+    }
+
+    /// Construye un encabezado PE minimo (DOS + COFF) para verificar que
+    /// `extraer_timestamp_pe` localiza correctamente el `TimeDateStamp`.
+    #[test]
+    fn test_extraer_timestamp_pe() {
+        let mut datos = vec![0u8; 128];
+        datos[0] = b'M';
+        datos[1] = b'Z';
+        let e_lfanew: u32 = 0x40;
+        datos[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+        datos[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // Machine (2) + NumberOfSections (2) antes del TimeDateStamp.
+        datos[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        datos[0x46..0x48].copy_from_slice(&3u16.to_le_bytes());
+        let timestamp_esperado: u32 = 1_600_000_000;
+        datos[0x48..0x4C].copy_from_slice(&timestamp_esperado.to_le_bytes());
+
+        assert_eq!(extraer_timestamp_pe(&datos), Some(timestamp_esperado));
+    }
+
+    #[test]
+    fn test_extraer_timestamp_pe_datos_invalidos() {
+        assert_eq!(extraer_timestamp_pe(&[0u8; 4]), None);
+        assert_eq!(extraer_timestamp_pe(&[0u8; 4096]), None);
+    }
+
+    /// Ante una colmena con encabezado invalido (no `SequenceNumberMismatch`
+    /// real, pero igualmente irrecuperable por validacion estricta), el modo
+    /// permisivo tambien puede fallar; en ese caso `abrir_hive_con_recuperacion`
+    /// debe propagar el error en lugar de entrar en panico.
+    #[test]
+    fn test_abrir_hive_con_recuperacion_datos_invalidos_propaga_error() {
+        // Demasiado corto para interpretarse como encabezado de colmena, ni
+        // siquiera en modo permisivo.
+        let bytes = vec![0u8; 4];
+        let resultado = abrir_hive_con_recuperacion(&bytes, true);
+        assert!(resultado.is_err());
     }
 
     /// Simula un error de lectura/parseo de Registro (colmena "sucia" o corrupta,
@@ -656,6 +1132,8 @@ mod tests {
         let colmenas = Colmenas {
             software: vec![0u8; 4096],
             system: Some(vec![0u8; 4096]),
+            software_logs_presentes: false,
+            system_logs_presentes: false,
             advertencias: Vec::new(),
         };
         let opciones = Opciones::default();
@@ -663,13 +1141,17 @@ mod tests {
         let resultado = analizar_colmenas(&colmenas, &opciones);
 
         assert!(resultado.is_ok());
-        let resultado = resultado.unwrap();
+        let (resultado, requiere_fallback_fs) = resultado.unwrap();
         assert!(!resultado.advertencias.is_empty());
         assert_eq!(
             resultado.vm_info.os_nombre,
             "Windows (Registro sucio / Inaccesible)"
         );
         assert!(resultado.programas.is_empty());
+        assert!(
+            requiere_fallback_fs,
+            "una colmena totalmente ilegible debe solicitar el fallback FS"
+        );
     }
 
     /// Verifica el mismo escenario a nivel del trait `InspectorOS` completo: si el

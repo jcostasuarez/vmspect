@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.4.0] - 2026-09-07
+
+**Breaking API refactor — public API reorganization for idiomatic Rust conventions.**
+
+This release introduces a comprehensive restructuring of the `vmspect` crate's public API.
+The refactoring eliminates a bloated root namespace (30+ exports), establishes canonical
+submodule paths for all domain types, and aligns the prelude with Rust ecosystem idioms.
+No backward compatibility is maintained; this breaking change prepares the crate for
+long-term maintainability and scalability.
+
+### Breaking Changes
+
+**Root Namespace (Minimalist API Surface)**
+- Reduced from 30+ exports to 4 types + 2 functions
+- Kept at root: `InspectionEngine`, `Options`, `InspectionReport`, `Result`, `VmSpectError`, `inspect()`, `inspect_with_progress()`
+- Removed from root: All discovery functions, domain models, utility functions, secondary traits
+
+**Canonical Submodule Paths (Required Explicit Imports)**
+- All domain models now accessed directly from their submodules (no re-export forwarding):
+  - `FileSystem`, `Partition`, `OperatingSystem`, `PartitionScheme` → `use vmspect::models::partition::*;`
+  - `Program`, `GuestInfo`, `GuestTools` → `use vmspect::models::software::*;`
+  - `ImageInfo`, `Hypervisor`, `Stats`, `format_bytes` → `use vmspect::models::image::*;`
+  - `CancellationToken`, `InspectionProgress`, `InspectionProgressEvent`, `InspectionOptions` → `use vmspect::models::options::*;`
+  - `OsInspector`, `VmDriver`, `MemoryMapper`, `AnalysisResult` → `use vmspect::models::traits::*;`
+- Discovery functions moved: `list_vms`, `is_vm_image`, `count_vms`, `is_secondary_extent`, `verify_image_integrity`, `requires_nbd`, `requires_qemu` → `use vmspect::vms::discovery::*;`
+- Virtual disk abstraction: `VirtualDisk` → `use vmspect::vms::stream::VirtualDisk;`
+
+**Prelude Reorganization**
+- Reduced from 30+ exports to 10 focused exports
+- Kept: Extensibility traits (`OsInspector`, `VmDriver`, `MemoryMapper`, `AnalysisResult`), core runtime structs (`InspectionEngine`, `ConcurrentProcessor`, `Options`), result types (`Result`, `VmSpectError`), progress tracking (`InspectionProgress`, `InspectionProgressEvent`, `CancellationToken`), entry functions (`inspect`, `inspect_with_progress`), and report type (`InspectionReport`)
+- Removed: All domain models, discovery functions, utility functions
+- Added comprehensive prelude documentation clarifying what's included and where to find other types
+
+**`src/models/mod.rs` Flattening**
+- Eliminated multi-tier re-export forwarding chains
+- All internal re-exports changed to `pub(crate)` or removed entirely
+- Only `InspectionReport` and `Options` remain as public re-exports (for root API convenience)
+- Types now accessed directly from their submodules
+
+**Migration Examples**
+```rust
+// Before (v0.3.3)
+use vmspect::prelude::*;
+let fs = FileSystem::Ntfs;
+let programs = list_vms(path, false)?;
+
+// After (v0.4.0)
+use vmspect::prelude::*;  // Still works for primary API
+use vmspect::models::partition::FileSystem;  // Domain models require explicit import
+use vmspect::vms::discovery::list_vms;  // Discovery functions moved to vms::discovery
+
+let fs = FileSystem::Ntfs;
+let programs = list_vms(path, false)?;
+```
+
+### Changed
+- Complete reorganization of public API: root namespace now surfaces only essential entry points and core types
+- Module structure reorganized for clarity: submodules are the canonical source of truth for all domain types
+- Prelude now contains only high-frequency traits and runtime structures, improving discoverability and reducing cognitive load
+- All internal crate code updated to use canonical submodule imports (parsers, VMs, engine, CLI binary)
+
+### Rationale
+
+The previous API structure had three critical issues:
+1. **Fat Root Namespace**: Over 30 re-exported items cluttered `lib.rs`, making it unclear what the primary API was
+2. **Prelude Duplication**: Prelude nearly duplicated root exports, offering no clear idiomatic purpose
+3. **Multi-level Re-exports**: Redundant forwarding chains in `models/mod.rs` made import paths ambiguous
+
+This refactor establishes idiomatic Rust API organization (matching patterns in `tokio`, `serde`, `sqlx`):
+- **Clarity**: Users immediately understand what the library's primary API is
+- **Consistency**: Every type has exactly one canonical import path
+- **Scalability**: New domain types added to submodules don't bloat the root
+- **Discoverability**: IDE autocomplete naturally guides users to the correct module
+- **Maintainability**: Clear module boundaries reduce confusion during maintenance
+
+### Quality Metrics
+- ✅ All 48 library unit tests pass
+- ✅ All 14 API structure tests pass (canonical paths verified)
+- ✅ All 7 integration tests pass
+- ✅ All 6 doc-tests pass
+- ✅ `cargo check --all-targets` passes
+- ✅ `cargo clippy --all-targets -- -D warnings` passes (zero warnings)
+- ✅ No unused imports or dead code paths
+- ✅ All examples compile and demonstrate new canonical import patterns
+
 ## [0.3.3] - 2026-09-06
 
 ### Changed

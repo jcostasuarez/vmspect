@@ -2,6 +2,7 @@
 /target/
 **/*.rs.bk
 *.pdb
+Cargo.lock
 
 # Optional Cargo lockfile rule
 # (Cargo.lock is typically kept for binaries and ignored or kept for libraries depending on workflow)
@@ -18,7 +19,15 @@
 *.iso
 *.dmg
 
-# Entornos y variables locales
+# Temporary & Generated Files
+*.svg
+*.dot
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Environment
 .env
 .env.*
 !.env.example

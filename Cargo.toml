@@ -26,3 +26,5 @@ tempfile = "3.10"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+# Evita que falle por dependencias en C o bash en entornos seguros de docs.rs
+cargo-args = ["-Zbuild-std"]

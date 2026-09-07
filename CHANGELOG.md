@@ -7,12 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.3.2] - 2026-09-06
+
+### Fixed
+- Updated release metadata to address `docs.rs` build environment compatibility.
+
 ## [0.3.1] - 2026-09-06
 
 ### Fixed
 - Added `[package.metadata.docs.rs]` configuration in `Cargo.toml` (`all-features = true`).
 - Fixed `rustdoc::private_intra_doc_links` warnings in `src/vms/mod.rs` to ensure clean compilation on docs.rs.
-- 
+
 ## [0.3.0] - 2026-09-06
 
 **Full English API refactoring — breaking change.**

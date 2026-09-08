@@ -1,5 +1,7 @@
 //! Centralized error handling for `vmspect`.
 
+use std::path::Path;
+
 use thiserror::Error;
 
 /// Enumeration of error kinds that may be produced during inspection and analysis.
@@ -29,6 +31,27 @@ pub enum VmSpectError {
     #[error("Inspection was cancelled by the user")]
     Cancelled,
 
+    /// A disk descriptor references a component that cannot be opened.
+    ///
+    /// VMDK descriptors commonly reference external extent files and parent disks. This
+    /// error deliberately keeps the descriptor path, the name as declared by the descriptor,
+    /// the resolved path and the original operating-system error so an integrator can repair
+    /// the input set instead of troubleshooting `qemu-nbd` installation.
+    #[error("Missing {component_type} '{declared_name}' referenced by '{descriptor_path}'. Resolved path: '{resolved_path}'. OS error: {source}")]
+    MissingDiskComponent {
+        /// Path of the descriptor that declared the missing component.
+        descriptor_path: String,
+        /// Name exactly as declared by the descriptor.
+        declared_name: String,
+        /// Path obtained after resolving the declaration relative to the descriptor.
+        resolved_path: String,
+        /// Human-readable component kind, such as `VMDK extent` or `VMDK parent disk`.
+        component_type: String,
+        /// Original error returned by the operating system.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// `qemu-nbd` binary or tool not found on the system.
     #[error("QEMU tool not available: {0}")]
     QemuNotFound(String),
@@ -52,6 +75,35 @@ pub enum VmSpectError {
     /// Generic or descriptive inspection failure message.
     #[error("Inspection error: {0}")]
     Other(String),
+}
+
+impl VmSpectError {
+    /// Builds a component error while preserving the original OS error for missing paths.
+    pub(crate) fn from_disk_component_io(
+        descriptor_path: &Path,
+        declared_name: &str,
+        resolved_path: &Path,
+        component_type: &str,
+        operation: &str,
+        source: std::io::Error,
+    ) -> Self {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Self::MissingDiskComponent {
+                descriptor_path: descriptor_path.display().to_string(),
+                declared_name: declared_name.to_string(),
+                resolved_path: resolved_path.display().to_string(),
+                component_type: component_type.to_string(),
+                source,
+            }
+        } else {
+            let message = format!(
+                "Could not {operation} {component_type} '{declared_name}' referenced by '{}'. Resolved path: '{}': {source}",
+                descriptor_path.display(),
+                resolved_path.display(),
+            );
+            Self::Io(std::io::Error::new(source.kind(), message))
+        }
+    }
 }
 
 impl From<String> for VmSpectError {

@@ -13,13 +13,14 @@
 //! - [`VirtualDisk`]: `Read + Seek` view of a disk range (typically a single
 //!   partition) with an LRU chunk cache. Consumed by the parsers.
 
+use crate::error::VmSpectError;
 use crate::models::traits::{MemoryMapper, VmDriver};
 use crate::models::{Hypervisor, ImageInfo, Options, Stats};
 use crate::vms::nbd::{self, NbdReader};
 use crate::vms::vmdk::{self, OpenResult, SparseExtent};
 use positioned_io::ReadAt;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -335,11 +336,21 @@ impl DiskReader {
 
     /// Opens the image, automatically selecting the most optimal backend for the supplied [`Options`].
     pub fn open_with_options(info: &ImageInfo, options: &Options) -> io::Result<Self> {
+        Self::open_with_options_diagnostic(info, options).map_err(diagnostic_to_io)
+    }
+
+    /// Internal opening path that retains the distinction between disk and tool failures.
+    pub(crate) fn open_with_options_diagnostic(
+        info: &ImageInfo,
+        options: &Options,
+    ) -> crate::error::Result<Self> {
         let (backend, mode, size_adjusted) = match open_native(info)? {
             OpenResult::Native((b, mode)) => (b, format!("native ({})", mode), info.virtual_size),
             OpenResult::NeedsNbd(reason) => {
-                let nbd_path = nbd::resolve_qemu_nbd(options.qemu_nbd.as_deref())?;
-                let nbd_reader = NbdReader::open_with_options(&nbd_path, info, options)?;
+                let nbd_path = nbd::resolve_qemu_nbd(options.qemu_nbd.as_deref())
+                    .map_err(|error| VmSpectError::QemuNotFound(error.to_string()))?;
+                let nbd_reader = NbdReader::open_with_options(&nbd_path, info, options)
+                    .map_err(nbd_error_to_vm)?;
                 let size_nbd = nbd_reader.virtual_size().max(info.virtual_size);
                 let channel = if options.unix_socket.is_some() {
                     "unix"
@@ -445,6 +456,31 @@ impl DiskReader {
     }
 }
 
+fn diagnostic_to_io(error: VmSpectError) -> io::Error {
+    match error {
+        VmSpectError::Io(source) => source,
+        other => io::Error::new(diagnostic_error_kind(&other), other),
+    }
+}
+
+fn diagnostic_error_kind(error: &VmSpectError) -> io::ErrorKind {
+    match error {
+        VmSpectError::ImageNotFound(_) => io::ErrorKind::NotFound,
+        VmSpectError::MissingDiskComponent { source, .. } => source.kind(),
+        VmSpectError::QemuNotFound(_) => io::ErrorKind::NotFound,
+        VmSpectError::Cancelled => io::ErrorKind::Interrupted,
+        _ => io::ErrorKind::Other,
+    }
+}
+
+fn nbd_error_to_vm(error: io::Error) -> VmSpectError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        VmSpectError::Cancelled
+    } else {
+        VmSpectError::Nbd(error.to_string())
+    }
+}
+
 impl VmDriver for DiskReader {
     fn virtual_size(&self) -> u64 {
         self.virtual_size
@@ -509,10 +545,20 @@ fn read_from_extents(extents: &mut [OpenExtent], offset: u64, len: usize) -> io:
 }
 
 /// Attempts to construct a native backend. Returns the reason when `qemu-nbd` is required.
-fn open_native(info: &ImageInfo) -> io::Result<OpenResult<(Backend, String)>> {
+fn open_main_image_file(path: &Path) -> crate::error::Result<File> {
+    open_read_file(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            VmSpectError::ImageNotFound(path.display().to_string())
+        } else {
+            VmSpectError::Io(source)
+        }
+    })
+}
+
+fn open_native(info: &ImageInfo) -> crate::error::Result<OpenResult<(Backend, String)>> {
     match info.format.to_ascii_lowercase().as_str() {
         "raw" => Ok(OpenResult::Native((
-            Backend::Raw(open_read_file(&info.path)?),
+            Backend::Raw(open_main_image_file(&info.path)?),
             "raw".to_string(),
         ))),
         "vmdk" => open_vmdk_native(&info.path),
@@ -520,8 +566,137 @@ fn open_native(info: &ImageInfo) -> io::Result<OpenResult<(Backend, String)>> {
     }
 }
 
-fn open_vmdk_native(path: &Path) -> io::Result<OpenResult<(Backend, String)>> {
-    let mut file = open_read_file(path)?;
+fn validate_parent_reference(
+    descriptor_path: &Path,
+    descriptor: &vmdk::Descriptor,
+) -> crate::error::Result<()> {
+    if let Some(parent_name) = descriptor
+        .parent_file_name_hint
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+    {
+        let parent_path = vmdk::resolve_extent_path(descriptor_path, parent_name);
+        vmdk::ensure_component_exists(
+            descriptor_path,
+            parent_name,
+            &parent_path,
+            "VMDK parent disk",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_extent_paths(
+    descriptor_path: &Path,
+    descriptor: &vmdk::Descriptor,
+) -> crate::error::Result<()> {
+    for extent in &descriptor.extents {
+        if extent.kind == "ZERO" {
+            continue;
+        }
+        let Some(name) = extent.file.as_deref() else {
+            continue;
+        };
+        let resolved_path = vmdk::resolve_extent_path(descriptor_path, name);
+        vmdk::ensure_component_exists(descriptor_path, name, &resolved_path, "VMDK extent")?;
+    }
+    Ok(())
+}
+
+fn validate_descriptor_components(
+    descriptor_path: &Path,
+    descriptor: &vmdk::Descriptor,
+) -> crate::error::Result<()> {
+    validate_parent_reference(descriptor_path, descriptor)?;
+    validate_extent_paths(descriptor_path, descriptor)
+}
+
+const MAX_VMDK_PARENT_DEPTH: usize = 32;
+
+/// Validates external VMDK dependencies before a backend is selected.
+///
+/// This preflight is also used when `force_nbd` is enabled. Selecting qemu-nbd must not turn a
+/// missing descriptor component into a tool-resolution error.
+pub(crate) fn validate_vmdk_components(path: &Path) -> crate::error::Result<()> {
+    let mut visited = HashSet::new();
+    validate_vmdk_components_inner(path, &mut visited, 0, None)
+}
+
+fn validate_vmdk_components_inner(
+    path: &Path,
+    visited: &mut HashSet<std::path::PathBuf>,
+    depth: usize,
+    parent_context: Option<(&Path, &str)>,
+) -> crate::error::Result<()> {
+    if depth > MAX_VMDK_PARENT_DEPTH {
+        return Err(VmSpectError::Parse(format!(
+            "VMDK parent chain exceeds the maximum depth of {} at '{}'",
+            MAX_VMDK_PARENT_DEPTH,
+            path.display()
+        )));
+    }
+
+    let identity = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(identity) {
+        return Err(VmSpectError::Parse(format!(
+            "VMDK parent chain contains a cycle at '{}'",
+            path.display()
+        )));
+    }
+
+    let mut file = match parent_context {
+        Some((descriptor_path, declared_name)) => {
+            vmdk::open_component_file(path, descriptor_path, declared_name, "VMDK parent disk")?
+        }
+        None => open_main_image_file(path)?,
+    };
+    let mut header = [0u8; 512];
+    let n = file.read(&mut header)?;
+    let header = &header[..n];
+
+    let descriptor = if vmdk::is_sparse_header(header) {
+        let cab = vmdk::read_sparse_header(header)?;
+        if cab.descriptor_offset == 0 || cab.descriptor_sectors == 0 {
+            None
+        } else {
+            let mut text = vec![0u8; (cab.descriptor_sectors * SECTOR) as usize];
+            file.seek(SeekFrom::Start(cab.descriptor_offset * SECTOR))?;
+            vmdk::read_or_zeros(&mut file, &mut text)?;
+            Some(vmdk::parse_descriptor(&String::from_utf8_lossy(&text)))
+        }
+    } else if vmdk::is_text_descriptor(header) {
+        let text = fs::read_to_string(path)?;
+        Some(vmdk::parse_descriptor(&text))
+    } else {
+        None
+    };
+
+    let Some(descriptor) = descriptor else {
+        return Ok(());
+    };
+
+    validate_descriptor_components(path, &descriptor)?;
+
+    if let Some(parent_name) = descriptor
+        .parent_file_name_hint
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+    {
+        let parent_path = vmdk::resolve_extent_path(path, parent_name);
+        validate_vmdk_components_inner(
+            &parent_path,
+            visited,
+            depth + 1,
+            Some((path, parent_name)),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn open_vmdk_native(path: &Path) -> crate::error::Result<OpenResult<(Backend, String)>> {
+    validate_vmdk_components(path)?;
+    let mut file = open_main_image_file(path)?;
     let mut header = [0u8; 512];
     let n = file.read(&mut header)?;
     let header = &header[..n];
@@ -540,7 +715,8 @@ fn open_vmdk_native(path: &Path) -> io::Result<OpenResult<(Backend, String)>> {
                     "VMDK delta/snapshot with a parent disk".to_string(),
                 ));
             }
-            // A monolithic sparse declaring multiple extents is rare; delegate.
+            // A monolithic sparse declaring multiple extents is rare; delegate, but first
+            // validate all declared files so a missing component is not reported as qemu-nbd.
             if d.extents.len() > 1 {
                 return Ok(OpenResult::NeedsNbd(
                     "VMDK sparse with multiple declared extents".to_string(),
@@ -585,12 +761,7 @@ fn open_vmdk_native(path: &Path) -> io::Result<OpenResult<(Backend, String)>> {
                     };
                     let ext_path = vmdk::resolve_extent_path(path, name);
                     ExtentData::Flat {
-                        file: open_read_file(&ext_path).map_err(|err| {
-                            io::Error::new(
-                                err.kind(),
-                                format!("Could not open extent {}: {}", ext_path.display(), err),
-                            )
-                        })?,
+                        file: vmdk::open_component_file(&ext_path, path, name, "VMDK extent")?,
                         offset: e.offset_sectors * SECTOR,
                     }
                 }
@@ -601,7 +772,7 @@ fn open_vmdk_native(path: &Path) -> io::Result<OpenResult<(Backend, String)>> {
                         ));
                     };
                     let ext_path = vmdk::resolve_extent_path(path, name);
-                    match SparseExtent::open(&ext_path)? {
+                    match SparseExtent::open(&ext_path, path, name, "VMDK extent")? {
                         OpenResult::Native(s) => ExtentData::Sparse(s),
                         OpenResult::NeedsNbd(m) => return Ok(OpenResult::NeedsNbd(m)),
                     }

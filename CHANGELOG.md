@@ -5,7 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (while the major version is `0`, minor-version increments may include breaking changes,
-(as foreseen by SemVer for the `0.y.z` series).
+as foreseen by SemVer for the `0.y.z` series).
+
+## [0.5.0] - 2026-09-08
+
+### Breaking Changes
+- Added the public `VmSpectError::MissingDiskComponent` variant. Consumers with exhaustive matches over `VmSpectError` must add a matching arm.
+
+### Fixed
+- Distinguished missing VMDK extents and parent disks from `qemu-nbd` resolution failures, preserving descriptor paths, resolved component paths and original OS errors.
+- Improved `qemu-nbd` diagnostics with the configured executable path, process exit code, `stderr` and timeout context.
 
 ## [0.4.2] - 2026-09-08
 

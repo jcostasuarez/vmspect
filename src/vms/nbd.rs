@@ -311,6 +311,53 @@ impl NbdTransport {
     }
 }
 
+#[cfg(windows)]
+fn new_nbd_command(path: &Path) -> std::process::Command {
+    let is_batch_script = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+        .unwrap_or(false);
+
+    if is_batch_script {
+        let mut command = new_command("cmd.exe");
+        command.arg("/C").arg("call").arg(path);
+        command
+    } else {
+        new_command(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn new_nbd_command(path: &Path) -> std::process::Command {
+    new_command(path)
+}
+
+fn read_child_stderr(child: &mut Child) -> String {
+    let mut stderr_text = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut stderr_text);
+    }
+    stderr_text.trim().to_string()
+}
+
+fn nbd_exit_message(path: &Path, status: std::process::ExitStatus, stderr: &str) -> String {
+    if stderr.is_empty() {
+        format!(
+            "qemu-nbd '{}' exited with code {:?}",
+            path.display(),
+            status.code()
+        )
+    } else {
+        format!(
+            "qemu-nbd '{}' exited with code {:?}; stderr: {}",
+            path.display(),
+            status.code(),
+            stderr
+        )
+    }
+}
+
 /// Reader backed by a `qemu-nbd` server running in the background.
 pub struct NbdReader {
     process: Child,
@@ -348,7 +395,7 @@ impl NbdReader {
             }
         }
 
-        let mut cmd = new_command(qemu_nbd_path);
+        let mut cmd = new_nbd_command(qemu_nbd_path);
         cmd.arg("--read-only");
 
         // Only include --persistent when explicitly requested
@@ -398,6 +445,7 @@ impl NbdReader {
             .unwrap_or_else(|| Duration::from_secs(3));
         let start = Instant::now();
         let mut client_opt = None;
+        let mut last_connection_error = None;
 
         while start.elapsed() < timeout {
             if let Some(ref cancel) = options.cancel_token {
@@ -411,20 +459,36 @@ impl NbdReader {
                 }
             }
 
-            // Check whether the process terminated prematurely with an error
-            if let Ok(Some(status)) = child.try_wait() {
-                let mut err_msg = String::new();
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_string(&mut err_msg);
+            // Check whether the process terminated prematurely with an error.
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let err_msg = read_child_stderr(&mut child);
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        nbd_exit_message(qemu_nbd_path, status, &err_msg),
+                    ));
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!(
-                        "qemu-nbd exited with code {:?}: {}",
-                        status.code(),
-                        err_msg.trim()
-                    ),
-                ));
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = read_child_stderr(&mut child);
+                    let detail = if stderr.is_empty() {
+                        format!(
+                            "Could not query qemu-nbd '{}' process status: {}",
+                            qemu_nbd_path.display(),
+                            error
+                        )
+                    } else {
+                        format!(
+                            "Could not query qemu-nbd '{}' process status: {}; stderr: {}",
+                            qemu_nbd_path.display(),
+                            error,
+                            stderr
+                        )
+                    };
+                    return Err(io::Error::other(detail));
+                }
             }
 
             match transport.connect() {
@@ -432,7 +496,38 @@ impl NbdReader {
                     client_opt = Some(stream);
                     break;
                 }
-                Err(_) => {
+                Err(error) => {
+                    let retryable = matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::NotFound
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::AddrNotAvailable
+                    );
+                    if !retryable {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let stderr = read_child_stderr(&mut child);
+                        let detail = if stderr.is_empty() {
+                            format!(
+                                "qemu-nbd '{}' NBD handshake failed: {}",
+                                qemu_nbd_path.display(),
+                                error
+                            )
+                        } else {
+                            format!(
+                                "qemu-nbd '{}' NBD handshake failed: {}; stderr: {}",
+                                qemu_nbd_path.display(),
+                                error,
+                                stderr
+                            )
+                        };
+                        return Err(io::Error::new(error.kind(), detail));
+                    }
+                    last_connection_error = Some(error);
                     sleep(Duration::from_millis(50));
                 }
             }
@@ -441,12 +536,38 @@ impl NbdReader {
         let client = match client_opt {
             Some(c) => c,
             None => {
+                // The connection attempt can consume the final polling interval. Check one
+                // last time before reporting a timeout so an already-exited qemu-nbd keeps its
+                // exit code and stderr.
+                if let Ok(Some(status)) = child.try_wait() {
+                    let err_msg = read_child_stderr(&mut child);
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        nbd_exit_message(qemu_nbd_path, status, &err_msg),
+                    ));
+                }
+
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Timed out waiting for the qemu-nbd server to accept connections",
-                ));
+                let stderr = read_child_stderr(&mut child);
+                let last_error = last_connection_error
+                    .map(|error| format!("; last connection error: {error}"))
+                    .unwrap_or_default();
+                let detail = if stderr.is_empty() {
+                    format!(
+                        "Timed out waiting for qemu-nbd '{}' to accept connections{}",
+                        qemu_nbd_path.display(),
+                        last_error
+                    )
+                } else {
+                    format!(
+                        "Timed out waiting for qemu-nbd '{}' to accept connections; stderr: {}{}",
+                        qemu_nbd_path.display(),
+                        stderr,
+                        last_error
+                    )
+                };
+                return Err(io::Error::new(io::ErrorKind::TimedOut, detail));
             }
         };
 
@@ -491,21 +612,31 @@ impl Drop for NbdReader {
 
 /// Locates the `qemu-nbd` binary on the system.
 pub fn resolve_qemu_nbd(explicit: Option<&Path>) -> io::Result<PathBuf> {
-    if let Some(p) = explicit {
-        if p.exists() {
-            return Ok(p.to_path_buf());
+    if let Some(path) = explicit {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
         }
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("The supplied qemu-nbd path does not exist: {}", p.display()),
+            format!(
+                "qemu-nbd executable was not found on the system at the configured path '{}'",
+                path.display()
+            ),
         ));
     }
 
-    if let Ok(env) = std::env::var("QEMU_NBD") {
-        let p = PathBuf::from(env);
-        if p.exists() {
-            return Ok(p);
+    if let Some(value) = std::env::var_os("QEMU_NBD") {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
         }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "qemu-nbd executable was not found on the system via QEMU_NBD='{}'",
+                path.display()
+            ),
+        ));
     }
 
     let candidates = [
@@ -515,29 +646,31 @@ pub fn resolve_qemu_nbd(explicit: Option<&Path>) -> io::Result<PathBuf> {
         "/usr/local/bin/qemu-nbd",
         "/opt/homebrew/bin/qemu-nbd",
     ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Ok(p);
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Ok(path);
         }
     }
 
-    // Look up in PATH
-    let on_path = new_command("qemu-nbd")
+    // Look up in PATH. A successful spawn is enough to establish that the executable exists;
+    // qemu-nbd's exit code for `--version` is not relevant to resolution.
+    match new_command("qemu-nbd")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if on_path {
-        return Ok(PathBuf::from("qemu-nbd"));
+    {
+        Ok(_) => Ok(PathBuf::from("qemu-nbd")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "qemu-nbd executable was not found on the system. Install it, add it to PATH, define QEMU_NBD, or use --qemu-nbd <path>.",
+        )),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("Could not resolve qemu-nbd from PATH: {error}"),
+        )),
     }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "The qemu-nbd executable was not found on the system. Install it, add it to PATH, define QEMU_NBD, or use --qemu-nbd <path>.",
-    ))
 }
 
 #[cfg(test)]
@@ -701,5 +834,62 @@ mod tests {
         assert_eq!(opc.extra_nbd_args, vec!["--cache=writeback".to_string()]);
         assert_eq!(opc.connection_timeout, Some(Duration::from_millis(500)));
         assert!(!opc.nbd_persistent);
+    }
+
+    #[test]
+    fn test_nbd_process_failure_preserves_path_code_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_path = if cfg!(windows) {
+            dir.path().join("fake qemu-nbd.cmd")
+        } else {
+            dir.path().join("fake-qemu-nbd")
+        };
+
+        #[cfg(windows)]
+        std::fs::write(
+            &helper_path,
+            "@echo off\r\necho simulated qemu-nbd failure 1>&2\r\nexit 23\r\n",
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &helper_path,
+                "#!/bin/sh\nprintf '%s\\n' 'simulated qemu-nbd failure' >&2\nexit 23\n",
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&helper_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper_path, permissions).unwrap();
+        }
+
+        let image_path = dir.path().join("disk.raw");
+        std::fs::write(&image_path, [0u8; 512]).unwrap();
+        let info = ImageInfo {
+            path: image_path,
+            format: "raw".to_string(),
+            virtual_size: 512,
+            actual_size: 512,
+            hypervisor: crate::models::Hypervisor::Unknown,
+        };
+        let options = Options {
+            connection_timeout: Some(Duration::from_secs(1)),
+            ..Options::default()
+        };
+
+        let error = match NbdReader::open_with_options(&helper_path, &info, &options) {
+            Ok(_) => panic!("the failing qemu-nbd helper must not connect"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        let message = error.to_string();
+        assert!(message.contains("fake qemu-nbd"), "message: {message}");
+        assert!(message.contains("23"), "message: {message}");
+        assert!(
+            message.contains("simulated qemu-nbd failure"),
+            "message: {message}"
+        );
     }
 }

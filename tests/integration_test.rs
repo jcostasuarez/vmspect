@@ -1,6 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use vmspect::prelude::*;
+use vmspect::vms::stream::DiskReader;
 
 #[test]
 fn test_options_defaults_and_helpers() {
@@ -115,6 +116,11 @@ fn test_qemu_not_found_when_nbd_is_required() {
                 "Unexpected message: {}",
                 msg
             );
+            assert!(
+                msg.contains("nonexistent_qemu_nbd_path"),
+                "The configured qemu-nbd path must be included: {}",
+                msg
+            );
         }
         other => panic!("Expected VmSpectError::QemuNotFound, got: {:?}", other),
     }
@@ -208,7 +214,9 @@ fn test_agnostic_extraction_without_rules_or_filters() {
     assert!(sample_packages
         .iter()
         .any(|p| p.name.contains("Redistributable")));
-    assert!(sample_packages.iter().any(|p| p.name.contains("Example Application")));
+    assert!(sample_packages
+        .iter()
+        .any(|p| p.name.contains("Example Application")));
 }
 
 #[test]
@@ -278,4 +286,258 @@ fn test_discovery_api_and_integrity() {
 
     assert!(!requires_nbd(&raw_path).unwrap());
     assert!(!requires_qemu(&raw_path).unwrap());
+}
+
+#[test]
+fn test_missing_vmdk_extent_has_component_context_not_qemu_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor_dir = dir.path().join("test-vm").join("test-images").join("guest");
+    std::fs::create_dir_all(&descriptor_dir).unwrap();
+
+    let descriptor_path = descriptor_dir.join("sample-disk.vmdk");
+    std::fs::write(
+        &descriptor_path,
+        r#"# Disk DescriptorFile
+version=1
+CID=abcdef01
+parentCID=ffffffff
+createType="twoGbMaxExtentSparse"
+
+# Extent description
+RW 8 SPARSE "sample-disk-s001.vmdk"
+RW 8 SPARSE "sample-disk-s002.vmdk"
+"#,
+    )
+    .unwrap();
+    // Deliberately create only s002: opening s001 must produce the component error.
+    std::fs::write(descriptor_dir.join("sample-disk-s002.vmdk"), []).unwrap();
+
+    let result = InspectionEngine::new(Options::default()).inspect(&descriptor_path);
+    match result {
+        Err(VmSpectError::MissingDiskComponent {
+            descriptor_path: actual_descriptor,
+            declared_name,
+            resolved_path,
+            component_type,
+            source,
+        }) => {
+            assert_eq!(actual_descriptor, descriptor_path.display().to_string());
+            assert_eq!(declared_name, "sample-disk-s001.vmdk");
+            assert_eq!(
+                resolved_path,
+                descriptor_dir
+                    .join("sample-disk-s001.vmdk")
+                    .display()
+                    .to_string()
+            );
+            assert_eq!(component_type, "VMDK extent");
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+        Err(VmSpectError::QemuNotFound(message)) => {
+            panic!("missing VMDK extent was misclassified as QemuNotFound: {message}");
+        }
+        other => panic!("Expected MissingDiskComponent, got: {other:?}"),
+    }
+
+    let message = match InspectionEngine::new(Options::default()).inspect(&descriptor_path) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the incomplete descriptor must fail"),
+    };
+    assert!(message.contains("sample-disk-s001.vmdk"));
+    assert!(message.contains(
+        &descriptor_dir
+            .join("sample-disk-s001.vmdk")
+            .display()
+            .to_string()
+    ));
+
+    let forced_result = InspectionEngine::new(Options {
+        force_nbd: true,
+        qemu_nbd: Some(descriptor_dir.join("missing-qemu-nbd.exe")),
+        ..Options::default()
+    })
+    .inspect(&descriptor_path);
+    assert!(
+        matches!(
+            forced_result,
+            Err(VmSpectError::MissingDiskComponent { .. })
+        ),
+        "force_nbd must not hide a missing VMDK component: {forced_result:?}"
+    );
+}
+
+#[test]
+fn test_missing_extent_in_parent_chain_has_parent_descriptor_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let child_path = dir.path().join("snapshot.vmdk");
+    let parent_path = dir.path().join("base.vmdk");
+
+    std::fs::write(
+        &child_path,
+        r#"# Disk DescriptorFile
+version=1
+CID=abcdef01
+parentCID=abcdef02
+parentFileNameHint="base.vmdk"
+createType="monolithicSparse"
+RW 1 ZERO
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &parent_path,
+        r#"# Disk DescriptorFile
+version=1
+CID=abcdef02
+parentCID=ffffffff
+createType="twoGbMaxExtentFlat"
+RW 1 FLAT "base-s001.vmdk" 0
+"#,
+    )
+    .unwrap();
+
+    let result = InspectionEngine::new(Options::default()).inspect(&child_path);
+    match result {
+        Err(VmSpectError::MissingDiskComponent {
+            descriptor_path,
+            declared_name,
+            resolved_path,
+            component_type,
+            ..
+        }) => {
+            assert_eq!(descriptor_path, parent_path.display().to_string());
+            assert_eq!(declared_name, "base-s001.vmdk");
+            assert_eq!(
+                resolved_path,
+                dir.path().join("base-s001.vmdk").display().to_string()
+            );
+            assert_eq!(component_type, "VMDK extent");
+        }
+        other => panic!("Expected parent-chain MissingDiskComponent, got: {other:?}"),
+    }
+}
+
+fn write_failing_qemu_nbd_helper(path: &std::path::Path) {
+    #[cfg(windows)]
+    std::fs::write(
+        path,
+        "@echo off\r\necho simulated qemu-nbd failure 1>&2\r\nexit 23\r\n",
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            "#!/bin/sh\nprintf '%s\\n' 'simulated qemu-nbd failure' >&2\nexit 23\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+}
+
+#[test]
+fn test_qemu_nbd_failure_is_preserved_as_public_nbd_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper_path = if cfg!(windows) {
+        dir.path().join("fake qemu-nbd.cmd")
+    } else {
+        dir.path().join("fake-qemu-nbd")
+    };
+    write_failing_qemu_nbd_helper(&helper_path);
+
+    let image_path = dir.path().join("server.qcow2");
+    std::fs::write(&image_path, b"QFI\xfb\x00\x00\x00\x03").unwrap();
+    let result = InspectionEngine::new(Options {
+        qemu_nbd: Some(helper_path.clone()),
+        connection_timeout: Some(std::time::Duration::from_secs(1)),
+        ..Options::default()
+    })
+    .inspect(&image_path);
+
+    match result {
+        Err(VmSpectError::Nbd(message)) => {
+            assert!(message.contains(&helper_path.display().to_string()));
+            assert!(message.contains("23"));
+            assert!(message.contains("simulated qemu-nbd failure"));
+        }
+        other => panic!("Expected VmSpectError::Nbd, got: {other:?}"),
+    }
+}
+
+fn write_minimal_sparse_extent(path: &std::path::Path) {
+    let mut bytes = vec![0u8; 1024];
+    bytes[0..4].copy_from_slice(b"KDMV");
+    bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+    bytes[12..20].copy_from_slice(&1u64.to_le_bytes()); // capacity: one sector
+    bytes[20..28].copy_from_slice(&1u64.to_le_bytes()); // one-sector grains
+    bytes[44..48].copy_from_slice(&1u32.to_le_bytes()); // one GTE per grain table
+    bytes[56..64].copy_from_slice(&1u64.to_le_bytes()); // grain directory at sector 1
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn test_complete_sparse_vmdk_descriptor_opens_natively() {
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor_path = dir.path().join("complete.vmdk");
+    std::fs::write(
+        &descriptor_path,
+        r#"# Disk DescriptorFile
+version=1
+CID=abcdef01
+parentCID=ffffffff
+createType="twoGbMaxExtentSparse"
+RW 1 SPARSE "complete-s001.vmdk"
+RW 1 SPARSE "complete-s002.vmdk"
+"#,
+    )
+    .unwrap();
+    write_minimal_sparse_extent(&dir.path().join("complete-s001.vmdk"));
+    write_minimal_sparse_extent(&dir.path().join("complete-s002.vmdk"));
+
+    let info = ImageInfo {
+        path: descriptor_path,
+        format: "vmdk".to_string(),
+        virtual_size: 1024,
+        actual_size: 2048,
+        hypervisor: Hypervisor::VMware,
+    };
+    let reader = DiskReader::open_with_options(&info, &Options::default()).unwrap();
+    assert!(reader.is_native());
+    assert!(reader.access_mode().contains("twoGbMaxExtentSparse"));
+}
+
+#[test]
+fn test_vmdk_paths_with_spaces_and_unicode_open_natively() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_dir = dir.path().join("test fixtures").join("vm-例");
+    std::fs::create_dir_all(&image_dir).unwrap();
+    let descriptor_path = image_dir.join("sample.vmdk");
+    let extent_path = image_dir.join("sample extent s001.vmdk");
+    std::fs::write(
+        &descriptor_path,
+        r#"# Disk DescriptorFile
+version=1
+CID=abcdef01
+parentCID=ffffffff
+createType="twoGbMaxExtentFlat"
+RW 1 FLAT "sample extent s001.vmdk" 0
+"#,
+    )
+    .unwrap();
+    std::fs::write(&extent_path, [0u8; 512]).unwrap();
+
+    let info = ImageInfo {
+        path: descriptor_path,
+        format: "vmdk".to_string(),
+        virtual_size: 512,
+        actual_size: 512,
+        hypervisor: Hypervisor::VMware,
+    };
+    let reader = DiskReader::open_with_options(&info, &Options::default()).unwrap();
+    assert!(reader.is_native());
+    assert!(reader.access_mode().contains("twoGbMaxExtentFlat"));
 }

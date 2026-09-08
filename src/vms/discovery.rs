@@ -110,6 +110,15 @@ pub fn is_secondary_extent(path: &Path) -> bool {
     false
 }
 
+fn is_vm_image_candidate(path: &Path) -> bool {
+    let ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.to_ascii_lowercase(),
+        None => return false,
+    };
+
+    SUPPORTED_EXTENSIONS.contains(&ext.as_str()) && !is_secondary_extent(path)
+}
+
 /// Determines whether a path corresponds to a supported VM disk image.
 ///
 /// Performs a fast, non-invasive validation:
@@ -119,7 +128,7 @@ pub fn is_secondary_extent(path: &Path) -> bool {
 ///
 /// # Parameters
 ///
-/// - `path`: Path to the candidate file or directory.
+/// - `path`: Path to the file or directory to test.
 ///
 /// # Returns
 ///
@@ -137,20 +146,7 @@ pub fn is_secondary_extent(path: &Path) -> bool {
 /// assert!(!is_vm_image(Path::new("notes.txt")));
 /// ```
 pub fn is_vm_image(path: &Path) -> bool {
-    if path.is_dir() {
-        return false;
-    }
-
-    let ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => e.to_ascii_lowercase(),
-        None => return false,
-    };
-
-    if !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
-        return false;
-    }
-
-    if is_secondary_extent(path) {
+    if path.is_dir() || !is_vm_image_candidate(path) {
         return false;
     }
 
@@ -163,6 +159,63 @@ pub fn is_vm_image(path: &Path) -> bool {
     true
 }
 
+fn validate_discovery_root(directory: &Path) -> Result<()> {
+    let metadata = match fs::metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(VmSpectError::ImageNotFound(format!(
+                "Directory not found: {}",
+                directory.display()
+            )))
+        }
+        Err(error) => return Err(VmSpectError::Io(error)),
+    };
+
+    if !metadata.is_dir() {
+        return Err(VmSpectError::Other(format!(
+            "The supplied path is not a directory: {}",
+            directory.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn warn_skipped_directory(path: &Path, error: &std::io::Error) {
+    eprintln!(
+        "Warning: skipping directory '{}' during VM discovery: {}",
+        path.display(),
+        error
+    );
+}
+
+fn warn_skipped_entry(path: &Path, error: &std::io::Error) {
+    eprintln!(
+        "Warning: skipping entry '{}' during VM discovery: {}",
+        path.display(),
+        error
+    );
+}
+
+fn warn_unreadable_entry(directory: &Path, error: &std::io::Error) {
+    eprintln!(
+        "Warning: skipping an unreadable entry in directory '{}' during VM discovery: {}",
+        directory.display(),
+        error
+    );
+}
+
+fn read_dir_or_warn(directory: &Path, root: &Path) -> Result<Option<fs::ReadDir>> {
+    match fs::read_dir(directory) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if directory == root => Err(VmSpectError::Io(error)),
+        Err(error) => {
+            warn_skipped_directory(directory, &error);
+            Ok(None)
+        }
+    }
+}
+
 /// Lists every VM disk image found in the supplied directory.
 ///
 /// # Parameters
@@ -172,8 +225,11 @@ pub fn is_vm_image(path: &Path) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`VmSpectError::ImageNotFound`] when the directory does not exist, or
-/// [`VmSpectError::Io`] if reading the directory entries fails.
+/// Returns [`VmSpectError::ImageNotFound`] when the directory does not exist,
+/// [`VmSpectError::Other`] when the supplied path is not a directory, or
+/// [`VmSpectError::Io`] when the root directory cannot be read. Errors found in
+/// descendant directories or entries are reported as warnings and skipped so
+/// that the rest of the accessible tree can still be analyzed.
 ///
 /// # Examples
 ///
@@ -186,46 +242,46 @@ pub fn is_vm_image(path: &Path) -> bool {
 /// # Ok::<(), vmspect::VmSpectError>(())
 /// ```
 pub fn list_vms(directory: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
-    if !directory.exists() {
-        return Err(VmSpectError::ImageNotFound(format!(
-            "Directory not found: {}",
-            directory.display()
-        )));
-    }
-    if !directory.is_dir() {
-        return Err(VmSpectError::Other(format!(
-            "The supplied path is not a directory: {}",
-            directory.display()
-        )));
-    }
+    validate_discovery_root(directory)?;
 
     let mut images = Vec::new();
     let mut queue = VecDeque::new();
     queue.push_back(directory.to_path_buf());
 
     while let Some(current_dir) = queue.pop_front() {
-        let entries = match fs::read_dir(&current_dir) {
-            Ok(entries) => entries,
-            Err(e) => return Err(VmSpectError::Io(e)),
+        let Some(entries) = read_dir_or_warn(&current_dir, directory)? else {
+            continue;
         };
 
         for entry in entries {
             let entry = match entry {
-                Ok(e) => e,
-                Err(e) => return Err(VmSpectError::Io(e)),
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn_unreadable_entry(&current_dir, &error);
+                    continue;
+                }
             };
             let path = entry.path();
             let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(e) => return Err(VmSpectError::Io(e)),
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    warn_skipped_entry(&path, &error);
+                    continue;
+                }
             };
 
             if file_type.is_dir() {
                 if recursive {
                     queue.push_back(path);
                 }
-            } else if file_type.is_file() && is_vm_image(&path) {
-                images.push(path);
+            } else if file_type.is_file() && is_vm_image_candidate(&path) {
+                match entry.metadata() {
+                    Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
+                        images.push(path);
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn_skipped_entry(&path, &error),
+                }
             }
         }
     }
@@ -243,7 +299,9 @@ pub fn list_vms(directory: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
 ///
 /// # Errors
 ///
-/// Returns an error when the directory does not exist or cannot be read.
+/// Returns an error when the root directory does not exist, is not a directory,
+/// or cannot be read. Errors found below the root are reported as warnings and
+/// skipped.
 pub fn count_vms(directory: &Path, recursive: bool) -> Result<usize> {
     list_vms(directory, recursive).map(|list| list.len())
 }
@@ -251,7 +309,9 @@ pub fn count_vms(directory: &Path, recursive: bool) -> Result<usize> {
 /// Reports whether at least one VM disk image is present in the supplied directory.
 ///
 /// Performs an optimized search with early-exit short-circuiting: returns `Ok(true)` as soon as
-/// the first matching file is found, without scanning the rest of the directory.
+/// the first matching file is found, without scanning the rest of the directory. When it returns
+/// `Ok(false)`, no image was found in the accessible portions that were visited; an inaccessible
+/// subtree may still contain an image.
 ///
 /// # Parameters
 ///
@@ -260,47 +320,47 @@ pub fn count_vms(directory: &Path, recursive: bool) -> Result<usize> {
 ///
 /// # Errors
 ///
-/// Returns an error when the directory does not exist or cannot be read.
+/// Returns an error when the root directory does not exist, is not a directory,
+/// or cannot be read. Errors found below the root are reported as warnings and
+/// skipped.
 pub fn has_vms(directory: &Path, recursive: bool) -> Result<bool> {
-    if !directory.exists() {
-        return Err(VmSpectError::ImageNotFound(format!(
-            "Directory not found: {}",
-            directory.display()
-        )));
-    }
-    if !directory.is_dir() {
-        return Err(VmSpectError::Other(format!(
-            "The supplied path is not a directory: {}",
-            directory.display()
-        )));
-    }
+    validate_discovery_root(directory)?;
 
     let mut queue = VecDeque::new();
     queue.push_back(directory.to_path_buf());
 
     while let Some(current_dir) = queue.pop_front() {
-        let entries = match fs::read_dir(&current_dir) {
-            Ok(entries) => entries,
-            Err(e) => return Err(VmSpectError::Io(e)),
+        let Some(entries) = read_dir_or_warn(&current_dir, directory)? else {
+            continue;
         };
 
         for entry in entries {
             let entry = match entry {
-                Ok(e) => e,
-                Err(e) => return Err(VmSpectError::Io(e)),
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn_unreadable_entry(&current_dir, &error);
+                    continue;
+                }
             };
             let path = entry.path();
             let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(e) => return Err(VmSpectError::Io(e)),
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    warn_skipped_entry(&path, &error);
+                    continue;
+                }
             };
 
             if file_type.is_dir() {
                 if recursive {
                     queue.push_back(path);
                 }
-            } else if file_type.is_file() && is_vm_image(&path) {
-                return Ok(true);
+            } else if file_type.is_file() && is_vm_image_candidate(&path) {
+                match entry.metadata() {
+                    Ok(metadata) if metadata.is_file() && metadata.len() > 0 => return Ok(true),
+                    Ok(_) => {}
+                    Err(error) => warn_skipped_entry(&path, &error),
+                }
             }
         }
     }

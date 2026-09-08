@@ -5,7 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (while the major version is `0`, minor-version increments may include breaking changes,
-as foreseen by SemVer for the `0.y.z` series).
+(as foreseen by SemVer for the `0.y.z` series).
+
+## [0.4.2] - 2026-09-08
+
+### Fixed
+- Hardened VM image discovery by validating root directories, ignoring zero-byte candidates, and continuing through unreadable descendant entries with warnings.
 
 ## [0.4.1] - 2026-09-07
 

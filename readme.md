@@ -40,6 +40,33 @@ It can examine partition-table structures (MBR/GPT), identify the guest operatin
 
 ---
 
+## Diagnóstico de discos VMDK y `qemu-nbd`
+
+Un descriptor VMDK no siempre contiene los datos del disco. Puede declarar varios extents
+(`FLAT`, `VMFS`, `VMFSRAW`, `SPARSE` o `VMFSSPARSE`) y también puede apuntar a un disco padre
+mediante `parentFileNameHint`. Todos esos archivos forman parte de la entrada que debe estar
+disponible para la inspección.
+
+Cuando falta un componente, `vmspect` devuelve `VmSpectError::MissingDiskComponent` en lugar de
+`VmSpectError::QemuNotFound`. El error conserva el nombre declarado, el descriptor principal,
+la ruta resuelta y el error original del sistema operativo. Por ejemplo:
+
+```text
+Missing VMDK extent 'drive-0-cl2-s001.vmdk' referenced by 'D:\PLC N°4\Máquinas Virtuales\Windows UE 6.0 ROckWell Revs 9\drive-0-cl2.vmdk'. Resolved path: 'D:\PLC N°4\Máquinas Virtuales\Windows UE 6.0 ROckWell Revs 9\drive-0-cl2-s001.vmdk'. OS error: The system cannot find the file specified.
+```
+
+`qemu-nbd` no puede reparar una cadena VMDK incompleta: solo proporciona acceso a una imagen
+que ya es coherente. Si falta un extent o un disco padre, hay que recuperar el archivo correcto
+desde el almacenamiento original o desde una copia consistente. No se debe renombrar otro
+extent para sustituir al faltante, porque eso puede mezclar segmentos distintos y producir una
+imagen silenciosamente corrupta.
+
+Los errores de resolución del ejecutable (`qemu_nbd`, `QEMU_NBD` o `PATH`) se reportan como
+`QemuNotFound`. Los fallos del proceso ya iniciado —código de salida distinto de cero,
+`stderr`, handshake o timeout NBD— se reportan como `Nbd` y conservan el contexto de ejecución.
+
+---
+
 ## 📂 Crate Structure
 
 The project follows the standard Rust library package convention:
@@ -82,7 +109,7 @@ Add `vmspect` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vmspect = "0.4.2"
+vmspect = "0.5.0"
 ```
 
 ---

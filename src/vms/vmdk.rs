@@ -11,6 +11,7 @@
 //!
 //! Reference: "Virtual Disk Format 5.0", VMware Technical Note.
 
+use crate::error::VmSpectError;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -137,6 +138,49 @@ impl Descriptor {
     }
 }
 
+/// Opens a file declared by a VMDK descriptor and preserves component context on failure.
+///
+/// This is shared by FLAT/VMFS extents and sparse extents so a missing path never gets
+/// mistaken for a missing `qemu-nbd` executable by the inspection engine.
+pub(crate) fn open_component_file(
+    path: &Path,
+    descriptor_path: &Path,
+    declared_name: &str,
+    component_type: &str,
+) -> crate::error::Result<File> {
+    crate::vms::stream::open_read_file(path).map_err(|source| {
+        VmSpectError::from_disk_component_io(
+            descriptor_path,
+            declared_name,
+            path,
+            component_type,
+            "open",
+            source,
+        )
+    })
+}
+
+/// Checks a descriptor-declared component before delegating a complex VMDK to `qemu-nbd`.
+pub(crate) fn ensure_component_exists(
+    descriptor_path: &Path,
+    declared_name: &str,
+    resolved_path: &Path,
+    component_type: &str,
+) -> crate::error::Result<()> {
+    std::fs::metadata(resolved_path)
+        .map(|_| ())
+        .map_err(|source| {
+            VmSpectError::from_disk_component_io(
+                descriptor_path,
+                declared_name,
+                resolved_path,
+                component_type,
+                "stat",
+                source,
+            )
+        })
+}
+
 pub fn is_text_descriptor(buf: &[u8]) -> bool {
     let start = &buf[..buf.len().min(64)];
     let text = String::from_utf8_lossy(start);
@@ -227,12 +271,45 @@ pub struct SparseExtent {
 }
 
 impl SparseExtent {
-    pub fn open(path: &Path) -> io::Result<OpenResult<Self>> {
-        let mut file = crate::vms::stream::open_read_file(path)?;
+    /// Opens a sparse extent with the descriptor context needed for actionable diagnostics.
+    pub fn open(
+        path: &Path,
+        descriptor_path: &Path,
+        declared_name: &str,
+        component_type: &str,
+    ) -> crate::error::Result<OpenResult<Self>> {
+        let mut file = open_component_file(path, descriptor_path, declared_name, component_type)?;
         let mut buf = [0u8; 512];
-        file.read_exact(&mut buf)?;
-        let cab = read_sparse_header(&buf)?;
-        Self::from_header(file, path, cab)
+        file.read_exact(&mut buf).map_err(|source| {
+            VmSpectError::from_disk_component_io(
+                descriptor_path,
+                declared_name,
+                path,
+                component_type,
+                "read",
+                source,
+            )
+        })?;
+        let cab = read_sparse_header(&buf).map_err(|source| {
+            VmSpectError::from_disk_component_io(
+                descriptor_path,
+                declared_name,
+                path,
+                component_type,
+                "read",
+                source,
+            )
+        })?;
+        Self::from_header(file, path, cab).map_err(|source| {
+            VmSpectError::from_disk_component_io(
+                descriptor_path,
+                declared_name,
+                path,
+                component_type,
+                "read",
+                source,
+            )
+        })
     }
 
     pub fn from_header(

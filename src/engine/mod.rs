@@ -7,7 +7,7 @@ use crate::models::InspectionReport;
 use crate::parsers;
 use crate::vms;
 use crate::vms::nbd::{self, NbdReader};
-use crate::vms::stream::{identify_image, DiskReader};
+use crate::vms::stream::{identify_image, validate_vmdk_components, DiskReader};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -315,10 +315,13 @@ impl InspectionEngine {
     ) -> Result<InspectionReport> {
         let start = Instant::now();
 
-        if !image_path.exists() {
-            return Err(VmSpectError::ImageNotFound(
-                image_path.display().to_string(),
-            ));
+        if let Err(error) = std::fs::metadata(image_path) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Err(VmSpectError::ImageNotFound(
+                    image_path.display().to_string(),
+                ));
+            }
+            return Err(VmSpectError::Io(error));
         }
 
         if self.is_cancelled() {
@@ -339,7 +342,14 @@ impl InspectionEngine {
             });
         }
 
-        let image = identify_image(effective_options.qemu_nbd.as_deref(), image_path)?;
+        let image =
+            identify_image(effective_options.qemu_nbd.as_deref(), image_path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    VmSpectError::ImageNotFound(image_path.display().to_string())
+                } else {
+                    VmSpectError::Io(error)
+                }
+            })?;
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
@@ -361,35 +371,22 @@ impl InspectionEngine {
         }
 
         let reader = if effective_options.force_nbd {
-            let nbd_path = match nbd::resolve_qemu_nbd(effective_options.qemu_nbd.as_deref()) {
-                Ok(r) => r,
-                Err(_) => {
-                    return Err(VmSpectError::QemuNotFound(
-                        "qemu-nbd executable was not found on the system".to_string(),
-                    ));
-                }
-            };
+            if image.format.eq_ignore_ascii_case("vmdk") {
+                validate_vmdk_components(&image.path)?;
+            }
+            let nbd_path = nbd::resolve_qemu_nbd(effective_options.qemu_nbd.as_deref())
+                .map_err(|error| VmSpectError::QemuNotFound(error.to_string()))?;
             let nbd_reader = NbdReader::open_with_options(&nbd_path, &image, &effective_options)
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::Interrupted => VmSpectError::Cancelled,
-                    _ => VmSpectError::Nbd(e.to_string()),
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        VmSpectError::Cancelled
+                    } else {
+                        VmSpectError::Nbd(error.to_string())
+                    }
                 })?;
             DiskReader::from_nbd(nbd_reader, &image, Some(self.cancel_token.clone()))
         } else {
-            match DiskReader::open_with_options(&image, &effective_options) {
-                Ok(r) => r,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        return Err(VmSpectError::QemuNotFound(
-                            "qemu-nbd executable was not found on the system".to_string(),
-                        ));
-                    }
-                    if e.kind() == std::io::ErrorKind::Interrupted {
-                        return Err(VmSpectError::Cancelled);
-                    }
-                    return Err(VmSpectError::Io(e));
-                }
-            }
+            DiskReader::open_with_options_diagnostic(&image, &effective_options)?
         };
 
         let chunk_size = effective_options

@@ -115,10 +115,15 @@ use std::path::Path;
 ///
 /// Returns a [`VmSpectError`] if:
 /// - The file at `image_path` does not exist ([`VmSpectError::ImageNotFound`]).
+/// - A VMDK descriptor references a missing extent or parent disk
+///   ([`VmSpectError::MissingDiskComponent`]). The error contains both the declared and
+///   resolved component paths, plus the original operating-system error.
 /// - The inspection was cancelled by the user ([`VmSpectError::Cancelled`]).
 /// - An I/O read error occurs on the image ([`VmSpectError::Io`]).
 /// - The image requires the `qemu-nbd` server and the executable is unavailable
 ///   ([`VmSpectError::QemuNotFound`]).
+/// - Starting or communicating with `qemu-nbd` fails ([`VmSpectError::Nbd`]), including the
+///   executable path, exit code and `stderr` when the subprocess provides them.
 /// - The partition table or underlying file system cannot be recognized
 ///   ([`VmSpectError::FileSystem`]).
 ///

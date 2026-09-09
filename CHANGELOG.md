@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.5.1] - 2026-09-09
+
+### Changed
+- Synchronized the crate metadata, lockfile and installation documentation for the `v0.5.1` patch release (no functional changes).
+
 ## [0.5.0] - 2026-09-08
 
 ### Breaking Changes

@@ -192,15 +192,15 @@ fn test_agnostic_extraction_without_rules_or_filters() {
             source: None,
         },
         Program {
-            name: "Example Application V18".to_string(),
+            name: "Siemens TIA Portal V18".to_string(),
             version: Some("18.0".to_string()),
-            publisher: Some("Example Publisher".to_string()),
+            publisher: Some("Siemens AG".to_string()),
             source: None,
         },
         Program {
-            name: "Example Runtime Redistributable (x64)".to_string(),
+            name: "Microsoft Visual C++ 2015-2022 Redistributable (x64)".to_string(),
             version: Some("14.36.32532".to_string()),
-            publisher: Some("Example Publisher".to_string()),
+            publisher: Some("Microsoft Corporation".to_string()),
             source: None,
         },
     ];
@@ -214,9 +214,7 @@ fn test_agnostic_extraction_without_rules_or_filters() {
     assert!(sample_packages
         .iter()
         .any(|p| p.name.contains("Redistributable")));
-    assert!(sample_packages
-        .iter()
-        .any(|p| p.name.contains("Example Application")));
+    assert!(sample_packages.iter().any(|p| p.name.contains("Siemens")));
 }
 
 #[test]
@@ -291,10 +289,14 @@ fn test_discovery_api_and_integrity() {
 #[test]
 fn test_missing_vmdk_extent_has_component_context_not_qemu_error() {
     let dir = tempfile::tempdir().unwrap();
-    let descriptor_dir = dir.path().join("test-vm").join("test-images").join("guest");
+    let descriptor_dir = dir
+        .path()
+        .join("PLC N°4")
+        .join("Máquinas Virtuales")
+        .join("VM");
     std::fs::create_dir_all(&descriptor_dir).unwrap();
 
-    let descriptor_path = descriptor_dir.join("sample-disk.vmdk");
+    let descriptor_path = descriptor_dir.join("drive-0-cl2.vmdk");
     std::fs::write(
         &descriptor_path,
         r#"# Disk DescriptorFile
@@ -304,13 +306,13 @@ parentCID=ffffffff
 createType="twoGbMaxExtentSparse"
 
 # Extent description
-RW 8 SPARSE "sample-disk-s001.vmdk"
-RW 8 SPARSE "sample-disk-s002.vmdk"
+RW 8 SPARSE "drive-0-cl2-s001.vmdk"
+RW 8 SPARSE "drive-0-cl2-s002.vmdk"
 "#,
     )
     .unwrap();
     // Deliberately create only s002: opening s001 must produce the component error.
-    std::fs::write(descriptor_dir.join("sample-disk-s002.vmdk"), []).unwrap();
+    std::fs::write(descriptor_dir.join("drive-0-cl2-s002.vmdk"), []).unwrap();
 
     let result = InspectionEngine::new(Options::default()).inspect(&descriptor_path);
     match result {
@@ -322,11 +324,11 @@ RW 8 SPARSE "sample-disk-s002.vmdk"
             source,
         }) => {
             assert_eq!(actual_descriptor, descriptor_path.display().to_string());
-            assert_eq!(declared_name, "sample-disk-s001.vmdk");
+            assert_eq!(declared_name, "drive-0-cl2-s001.vmdk");
             assert_eq!(
                 resolved_path,
                 descriptor_dir
-                    .join("sample-disk-s001.vmdk")
+                    .join("drive-0-cl2-s001.vmdk")
                     .display()
                     .to_string()
             );
@@ -343,10 +345,10 @@ RW 8 SPARSE "sample-disk-s002.vmdk"
         Err(error) => error.to_string(),
         Ok(_) => panic!("the incomplete descriptor must fail"),
     };
-    assert!(message.contains("sample-disk-s001.vmdk"));
+    assert!(message.contains("drive-0-cl2-s001.vmdk"));
     assert!(message.contains(
         &descriptor_dir
-            .join("sample-disk-s001.vmdk")
+            .join("drive-0-cl2-s001.vmdk")
             .display()
             .to_string()
     ));
@@ -513,10 +515,14 @@ RW 1 SPARSE "complete-s002.vmdk"
 #[test]
 fn test_vmdk_paths_with_spaces_and_unicode_open_natively() {
     let dir = tempfile::tempdir().unwrap();
-    let image_dir = dir.path().join("test fixtures").join("vm-例");
+    let image_dir = dir
+        .path()
+        .join("PLC N°4")
+        .join("Máquinas Virtuales")
+        .join("VM");
     std::fs::create_dir_all(&image_dir).unwrap();
-    let descriptor_path = image_dir.join("sample.vmdk");
-    let extent_path = image_dir.join("sample extent s001.vmdk");
+    let descriptor_path = image_dir.join("drive.vmdk");
+    let extent_path = image_dir.join("drive extent s001.vmdk");
     std::fs::write(
         &descriptor_path,
         r#"# Disk DescriptorFile
@@ -524,7 +530,7 @@ version=1
 CID=abcdef01
 parentCID=ffffffff
 createType="twoGbMaxExtentFlat"
-RW 1 FLAT "sample extent s001.vmdk" 0
+RW 1 FLAT "drive extent s001.vmdk" 0
 "#,
     )
     .unwrap();

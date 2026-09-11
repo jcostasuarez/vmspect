@@ -623,6 +623,7 @@ pub fn requires_qemu(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation::lock_test_operation;
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -735,6 +736,7 @@ mod tests {
 
     #[test]
     fn test_list_count_has_vms() {
+        let _test_lock = lock_test_operation();
         let dir = tempdir().unwrap();
         let sub = dir.path().join("subdir");
         fs::create_dir(&sub).unwrap();
@@ -775,6 +777,7 @@ mod tests {
 
     #[test]
     fn test_discovery_options_exclusions_and_depth() {
+        let _test_lock = lock_test_operation();
         let dir = tempdir().unwrap();
         let first = dir.path().join("first");
         let second = first.join("second");

@@ -9,7 +9,7 @@ use crate::models::{ImageInfo, Options};
 use crate::vms::stream::new_command;
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +23,26 @@ const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_DISC: u16 = 2;
 
 const NBD_OPT_EXPORT_NAME: u32 = 1;
+const DEFAULT_NBD_TIMEOUT: Duration = Duration::from_secs(3);
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_millis(200);
+
+fn remaining(deadline: Instant, context: &str) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, format!("Timed out {context}")))
+}
+
+fn contextualize_timeout(error: io::Error, context: &str) -> io::Error {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) {
+        io::Error::new(io::ErrorKind::TimedOut, format!("Timed out {context}"))
+    } else {
+        io::Error::new(error.kind(), format!("NBD {context}: {error}"))
+    }
+}
 
 /// Process-wide accounting for active qemu-nbd sessions.
 static NBD_SESSIONS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
@@ -30,7 +50,7 @@ static NBD_SESSIONS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
 struct NbdSessionPermit;
 
 impl NbdSessionPermit {
-    fn acquire(options: &Options) -> io::Result<Self> {
+    fn acquire(options: &Options, deadline: Instant) -> io::Result<Self> {
         let (active, wake) = NBD_SESSIONS.get_or_init(|| (Mutex::new(0), Condvar::new()));
         let limit = options.nbd_max_sessions.max(1);
         let mut count = active.lock().unwrap_or_else(|error| error.into_inner());
@@ -46,8 +66,10 @@ impl NbdSessionPermit {
                     "Inspection cancelled",
                 ));
             }
+            let wait = remaining(deadline, "waiting for an NBD session slot")?
+                .min(Duration::from_millis(50));
             let (new_count, _) = wake
-                .wait_timeout(count, Duration::from_millis(50))
+                .wait_timeout(count, wait)
                 .unwrap_or_else(|error| error.into_inner());
             count = new_count;
         }
@@ -74,6 +96,22 @@ enum StreamTransport {
 }
 
 impl StreamTransport {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            StreamTransport::Tcp(stream) => stream.set_read_timeout(timeout),
+            #[cfg(unix)]
+            StreamTransport::Unix(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            StreamTransport::Tcp(stream) => stream.set_write_timeout(timeout),
+            #[cfg(unix)]
+            StreamTransport::Unix(stream) => stream.set_write_timeout(timeout),
+        }
+    }
+
     fn shutdown(&self) -> io::Result<()> {
         match self {
             StreamTransport::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
@@ -116,15 +154,69 @@ pub struct NbdStream {
     stream: StreamTransport,
     export_size: u64,
     request_id: u64,
+    io_timeout: Duration,
+    disconnected: bool,
 }
 
 impl NbdStream {
+    fn read_exact_until(
+        stream: &mut StreamTransport,
+        buffer: &mut [u8],
+        deadline: Instant,
+        context: &str,
+    ) -> io::Result<()> {
+        let mut read = 0;
+        while read < buffer.len() {
+            stream.set_read_timeout(Some(remaining(deadline, context)?))?;
+            match stream.read(&mut buffer[read..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("NBD {context}: connection closed"),
+                    ))
+                }
+                Ok(n) => read += n,
+                Err(error) => return Err(contextualize_timeout(error, context)),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_all_until(
+        stream: &mut StreamTransport,
+        buffer: &[u8],
+        deadline: Instant,
+        context: &str,
+    ) -> io::Result<()> {
+        let mut written = 0;
+        while written < buffer.len() {
+            stream.set_write_timeout(Some(remaining(deadline, context)?))?;
+            match stream.write(&buffer[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("NBD {context}: connection closed"),
+                    ))
+                }
+                Ok(n) => written += n,
+                Err(error) => return Err(contextualize_timeout(error, context)),
+            }
+        }
+        stream.set_write_timeout(Some(remaining(deadline, context)?))?;
+        stream
+            .flush()
+            .map_err(|error| contextualize_timeout(error, context))
+    }
+
     /// Performs the standard (newstyle) handshake over the provided transport.
-    fn handshake(mut stream: StreamTransport) -> io::Result<Self> {
-        // 1. Read the initial banner from the server.
+    fn handshake(
+        mut stream: StreamTransport,
+        deadline: Instant,
+        io_timeout: Duration,
+    ) -> io::Result<Self> {
         // Magic: "NBDMAGIC" (8 bytes) + "IHAVEOPT" (8 bytes) + flags (2 bytes)
         let mut banner = [0u8; 18];
-        stream.read_exact(&mut banner)?;
+        Self::read_exact_until(&mut stream, &mut banner, deadline, "reading NBD banner")?;
 
         if &banner[0..8] != b"NBDMAGIC" {
             return Err(io::Error::new(
@@ -156,7 +248,12 @@ impl NbdStream {
 
         // 2. Send client flags (NBD_FLAG_C_FIXED_NEWSTYLE = 1)
         let client_flags: u32 = 1;
-        stream.write_all(&client_flags.to_be_bytes())?;
+        Self::write_all_until(
+            &mut stream,
+            &client_flags.to_be_bytes(),
+            deadline,
+            "sending NBD client flags",
+        )?;
 
         // 3. Negotiate the export (NBD_OPT_EXPORT_NAME = 1, export_name = "")
         let export_name = b"";
@@ -165,13 +262,12 @@ impl NbdStream {
         opt_req.extend_from_slice(&NBD_OPT_EXPORT_NAME.to_be_bytes());
         opt_req.extend_from_slice(&(export_name.len() as u32).to_be_bytes());
         opt_req.extend_from_slice(export_name);
-        stream.write_all(&opt_req)?;
-        stream.flush()?;
+        Self::write_all_until(&mut stream, &opt_req, deadline, "requesting NBD export")?;
 
         // 4. Receive the export reply.
         // export_size (8 bytes) + flags (2 bytes) + zeros (124 bytes) = 134 bytes
         let mut resp = [0u8; 134];
-        stream.read_exact(&mut resp)?;
+        Self::read_exact_until(&mut stream, &mut resp, deadline, "reading NBD export reply")?;
 
         let export_size = resp
             .get(0..8)
@@ -184,10 +280,14 @@ impl NbdStream {
                 )
             })?;
 
+        stream.set_read_timeout(Some(io_timeout))?;
+        stream.set_write_timeout(Some(io_timeout))?;
         Ok(Self {
             stream,
             export_size,
             request_id: 1,
+            io_timeout,
+            disconnected: false,
         })
     }
 
@@ -198,21 +298,67 @@ impl NbdStream {
 
     /// Connects to an NBD server over TCP and performs the standard handshake.
     pub fn connect_tcp(address: &str) -> io::Result<Self> {
-        let stream = TcpStream::connect(address)?;
-        stream.set_nodelay(true)?;
-        Self::handshake(StreamTransport::Tcp(stream))
+        Self::connect_tcp_with_timeout(address, DEFAULT_NBD_TIMEOUT)
+    }
+
+    fn connect_tcp_with_timeout(address: &str, timeout: Duration) -> io::Result<Self> {
+        Self::connect_tcp_with_timeouts(address, timeout, timeout)
+    }
+
+    fn connect_tcp_with_timeouts(
+        address: &str,
+        handshake_timeout: Duration,
+        io_timeout: Duration,
+    ) -> io::Result<Self> {
+        let deadline = Instant::now() + handshake_timeout;
+        let addresses = address.to_socket_addrs()?;
+        let mut last_error = None;
+        for address in addresses {
+            match TcpStream::connect_timeout(
+                &address,
+                remaining(deadline, "connecting to NBD server")?,
+            ) {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    return Self::handshake(StreamTransport::Tcp(stream), deadline, io_timeout);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "NBD address did not resolve",
+            )
+        }))
     }
 
     /// Connects to an NBD server via a UNIX domain socket.
     pub fn connect_unix(path: &Path) -> io::Result<Self> {
+        Self::connect_unix_with_timeout(path, DEFAULT_NBD_TIMEOUT)
+    }
+
+    fn connect_unix_with_timeout(path: &Path, timeout: Duration) -> io::Result<Self> {
+        Self::connect_unix_with_timeouts(path, timeout, timeout)
+    }
+
+    fn connect_unix_with_timeouts(
+        path: &Path,
+        handshake_timeout: Duration,
+        io_timeout: Duration,
+    ) -> io::Result<Self> {
         #[cfg(unix)]
         {
             let stream = std::os::unix::net::UnixStream::connect(path)?;
-            Self::handshake(StreamTransport::Unix(stream))
+            Self::handshake(
+                StreamTransport::Unix(stream),
+                Instant::now() + handshake_timeout,
+                io_timeout,
+            )
         }
         #[cfg(not(unix))]
         {
-            let _ = path;
+            let _ = (path, handshake_timeout, io_timeout);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "UNIX domain sockets are not supported on this platform",
@@ -249,13 +395,18 @@ impl NbdStream {
         req[16..24].copy_from_slice(&offset.to_be_bytes());
         req[24..28].copy_from_slice(&(adjusted_len as u32).to_be_bytes());
 
-        self.stream.write_all(&req)?;
-        self.stream.flush()?;
+        let deadline = Instant::now() + self.io_timeout;
+        Self::write_all_until(&mut self.stream, &req, deadline, "sending NBD read request")?;
 
         // Read the response header (16 bytes)
         // 4: Magic, 4: Error, 8: Handle
         let mut resp_hdr = [0u8; 16];
-        self.stream.read_exact(&mut resp_hdr)?;
+        Self::read_exact_until(
+            &mut self.stream,
+            &mut resp_hdr,
+            deadline,
+            "reading NBD reply header",
+        )?;
 
         let magic = resp_hdr
             .get(0..4)
@@ -303,20 +454,31 @@ impl NbdStream {
         }
 
         let mut data = vec![0u8; adjusted_len];
-        self.stream.read_exact(&mut data)?;
+        Self::read_exact_until(
+            &mut self.stream,
+            &mut data,
+            deadline,
+            "reading NBD reply data",
+        )?;
 
         Ok(data)
     }
 
     /// Cleanly closes the NBD session by sending the disconnect command and closing the socket.
     pub fn disconnect(&mut self) {
+        if self.disconnected {
+            return;
+        }
+        self.disconnected = true;
         let req_id = self.request_id;
         let mut req = [0u8; 28];
         req[0..4].copy_from_slice(&NBD_REQUEST_MAGIC.to_be_bytes());
         req[6..8].copy_from_slice(&NBD_CMD_DISC.to_be_bytes());
         req[8..16].copy_from_slice(&req_id.to_be_bytes());
-        let _ = self.stream.write_all(&req);
-        let _ = self.stream.flush();
+        // Cleanup must remain bounded even when normal I/O permits a longer timeout.
+        let cleanup_timeout = self.io_timeout.min(PROCESS_CLEANUP_TIMEOUT);
+        let deadline = Instant::now() + cleanup_timeout;
+        let _ = Self::write_all_until(&mut self.stream, &req, deadline, "sending NBD disconnect");
         let _ = self.stream.shutdown();
     }
 }
@@ -337,10 +499,15 @@ enum NbdTransport {
 }
 
 impl NbdTransport {
-    fn connect(&self) -> io::Result<NbdStream> {
+    fn connect(&self, deadline: Instant, io_timeout: Duration) -> io::Result<NbdStream> {
+        let timeout = remaining(deadline, "connecting to qemu-nbd")?;
         match self {
-            NbdTransport::Unix(path) => NbdStream::connect_unix(path),
-            NbdTransport::Tcp(address) => NbdStream::connect_tcp(address),
+            NbdTransport::Unix(path) => {
+                NbdStream::connect_unix_with_timeouts(path, timeout, io_timeout)
+            }
+            NbdTransport::Tcp(address) => {
+                NbdStream::connect_tcp_with_timeouts(address, timeout, io_timeout)
+            }
         }
     }
 
@@ -374,6 +541,34 @@ fn new_nbd_command(path: &Path) -> std::process::Command {
     new_command(path)
 }
 
+/// Makes a best effort to terminate and reap a child without allowing cleanup to block forever.
+///
+/// A child that does not exit within [`PROCESS_CLEANUP_TIMEOUT`] may remain alive after this
+/// function returns. Returns whether the child was reaped, which makes reading its stderr safe.
+fn terminate_and_reap(child: &mut Child) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+
+    let _ = child.kill();
+    let deadline = Instant::now() + PROCESS_CLEANUP_TIMEOUT;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) | Err(_) => sleep(Duration::from_millis(10)),
+        }
+    }
+    matches!(child.try_wait(), Ok(Some(_)))
+}
+
+fn terminate_and_collect_stderr(child: &mut Child) -> String {
+    if terminate_and_reap(child) {
+        read_child_stderr(child)
+    } else {
+        String::new()
+    }
+}
+
 fn read_child_stderr(child: &mut Child) -> String {
     let mut stderr_text = String::new();
     if let Some(mut stderr) = child.stderr.take() {
@@ -401,11 +596,11 @@ fn nbd_exit_message(path: &Path, status: std::process::ExitStatus, stderr: &str)
 
 /// Reader backed by a `qemu-nbd` server running in the background.
 pub struct NbdReader {
-    // Must be dropped after the process and socket, keeping the slot for the full session lifetime.
-    _permit: NbdSessionPermit,
-    process: Child,
+    // Fields are ordered so the stream and process are dropped before the permit.
     client: RefCell<NbdStream>,
+    process: Child,
     unix_socket: Option<PathBuf>,
+    _permit: NbdSessionPermit,
 }
 
 impl NbdReader {
@@ -438,7 +633,9 @@ impl NbdReader {
             }
         }
 
-        let permit = NbdSessionPermit::acquire(options)?;
+        let timeout = options.connection_timeout.unwrap_or(DEFAULT_NBD_TIMEOUT);
+        let deadline = Instant::now() + timeout;
+        let permit = NbdSessionPermit::acquire(options, deadline)?;
         let mut cmd = new_nbd_command(qemu_nbd_path);
         cmd.arg("--read-only");
 
@@ -483,19 +680,14 @@ impl NbdReader {
             ))
         })?;
 
-        // Retry the connection with polling bounded by connection_timeout (3s default)
-        let timeout = options
-            .connection_timeout
-            .unwrap_or_else(|| Duration::from_secs(3));
-        let start = Instant::now();
+        // Retry connection and handshake within the single initialization deadline.
         let mut client_opt = None;
         let mut last_connection_error = None;
 
-        while start.elapsed() < timeout {
+        while Instant::now() < deadline {
             if let Some(ref cancel) = options.cancel_token {
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = terminate_and_reap(&mut child);
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "Inspection cancelled",
@@ -514,9 +706,7 @@ impl NbdReader {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let stderr = read_child_stderr(&mut child);
+                    let stderr = terminate_and_collect_stderr(&mut child);
                     let detail = if stderr.is_empty() {
                         format!(
                             "Could not query qemu-nbd '{}' process status: {}",
@@ -535,7 +725,7 @@ impl NbdReader {
                 }
             }
 
-            match transport.connect() {
+            match transport.connect(deadline, timeout) {
                 Ok(stream) => {
                     client_opt = Some(stream);
                     break;
@@ -552,9 +742,7 @@ impl NbdReader {
                             | io::ErrorKind::AddrNotAvailable
                     );
                     if !retryable {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let stderr = read_child_stderr(&mut child);
+                        let stderr = terminate_and_collect_stderr(&mut child);
                         let detail = if stderr.is_empty() {
                             format!(
                                 "qemu-nbd '{}' NBD handshake failed: {}",
@@ -591,9 +779,7 @@ impl NbdReader {
                     ));
                 }
 
-                let _ = child.kill();
-                let _ = child.wait();
-                let stderr = read_child_stderr(&mut child);
+                let stderr = terminate_and_collect_stderr(&mut child);
                 let last_error = last_connection_error
                     .map(|error| format!("; last connection error: {error}"))
                     .unwrap_or_default();
@@ -616,10 +802,10 @@ impl NbdReader {
         };
 
         Ok(Self {
-            _permit: permit,
-            process: child,
             client: RefCell::new(client),
+            process: child,
             unix_socket: transport.unix_socket(),
+            _permit: permit,
         })
     }
 
@@ -643,8 +829,7 @@ impl Drop for NbdReader {
         match self.process.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {
-                let _ = self.process.kill();
-                let _ = self.process.wait();
+                let _ = terminate_and_reap(&mut self.process);
             }
         }
 
@@ -728,6 +913,64 @@ mod tests {
         assert_eq!(NBD_REPLY_MAGIC, 0x6744_6698);
         assert_eq!(NBD_CMD_READ, 0);
         assert_eq!(NBD_CMD_DISC, 2);
+    }
+
+    #[test]
+    fn test_nbd_stream_tcp_handshake_times_out_without_banner() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let started = Instant::now();
+        let error = match NbdStream::connect_tcp_with_timeout(&address, Duration::from_millis(200))
+        {
+            Ok(_) => panic!("a server that never sends its banner must time out"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(server);
+    }
+
+    #[test]
+    fn test_nbd_stream_handshake_preserves_io_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(120));
+
+            let mut banner = Vec::new();
+            banner.extend_from_slice(b"NBDMAGIC");
+            banner.extend_from_slice(&NBD_IHAVEOPT_MAGIC.to_be_bytes());
+            banner.extend_from_slice(&0u16.to_be_bytes());
+            stream.write_all(&banner).unwrap();
+
+            let mut client_flags = [0u8; 4];
+            stream.read_exact(&mut client_flags).unwrap();
+            let mut opt_req = [0u8; 16];
+            stream.read_exact(&mut opt_req).unwrap();
+
+            let mut export_reply = vec![0u8; 134];
+            export_reply[0..8].copy_from_slice(&4u64.to_be_bytes());
+            stream.write_all(&export_reply).unwrap();
+
+            let mut read_request = [0u8; 28];
+            stream.read_exact(&mut read_request).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut nbd =
+            NbdStream::connect_tcp_with_timeout(&address, Duration::from_millis(200)).unwrap();
+        let read_started = Instant::now();
+        let error = nbd.read_range(0, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(read_started.elapsed() >= Duration::from_millis(160));
+        drop(nbd);
+        server.join().unwrap();
     }
 
     #[test]

@@ -4,6 +4,9 @@ use crate::error::{Result, VmSpectError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+
 static ACTIVE_OPERATION: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Guard that marks the process-wide discovery/batch slot as available on drop.
@@ -31,11 +34,23 @@ pub(crate) fn acquire_active_operation() -> Result<ActiveOperationGuard> {
 }
 
 #[cfg(test)]
+static TEST_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn lock_test_operation() -> MutexGuard<'static, ()> {
+    TEST_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn active_operation_is_exclusive_and_released_by_drop() {
+        let _test_lock = lock_test_operation();
         let guard = acquire_active_operation().expect("first operation acquires the slot");
         let error = acquire_active_operation()
             .err()

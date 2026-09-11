@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.7.0] - 2026-09-11
+
+### Added
+- Added bounded NBD connection, handshake and I/O timeouts, including contextual timeout errors.
+- Added bounded qemu-nbd cleanup and non-blocking disconnect handling.
+
+### Changed
+- Preserved the configured NBD I/O timeout after the handshake and bounded session-slot waits by the connection deadline.
+- Serialized tests that share the process-wide discovery operation slot to avoid test-order races.
+
 ## [0.6.0] - 2026-09-11
 
 ### Breaking Changes

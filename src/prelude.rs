@@ -4,9 +4,8 @@ pub use crate::engine::{ConcurrentProcessor, InspectionEngine};
 pub use crate::error::{Result, VmSpectError};
 pub use crate::models::image::{format_bytes, Hypervisor, ImageInfo, Stats};
 pub use crate::models::options::{
-    BatchProgressEvent, BatchResult, CancellationToken, ImageInspectionError, InspectionOptions,
-    InspectionProgress, InspectionProgressEvent, InspectionReport, InspectionSummary, Options,
-    ProgressSnapshot,
+    BatchResult, CancellationToken, ImageInspectionError, InspectionOptions, InspectionProgress,
+    InspectionProgressEvent, InspectionReport, InspectionSummary, Options, ProgressSnapshot,
 };
 pub use crate::models::partition::{FileSystem, OperatingSystem, Partition, PartitionScheme};
 pub use crate::models::software::{GuestInfo, GuestTools, Program};

@@ -59,7 +59,8 @@ impl CancellationToken {
 /// Immutable snapshot of the progress for external inspection or serialization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgressSnapshot {
-    /// Global completion percentage (0..=100).
+    /// Completion percentage (0..=100). When tasks are scheduled, it is derived from
+    /// `completed_tasks / total_tasks * 100`.
     pub percentage: u8,
     /// Numeric identifier of the current stage.
     pub stage_id: u8,
@@ -92,6 +93,8 @@ pub struct InspectionProgress {
     pub stage_id: AtomicU8,
     /// Atomic cancellation flag.
     pub cancelled: AtomicBool,
+    // Keeps an externally supplied cancellation token observable by snapshots.
+    cancellation_token: Option<Arc<AtomicBool>>,
 }
 
 impl Default for InspectionProgress {
@@ -111,16 +114,15 @@ impl InspectionProgress {
             percentage: AtomicU8::new(0),
             stage_id: AtomicU8::new(0),
             cancelled: AtomicBool::new(false),
+            cancellation_token: None,
         }
     }
 
     /// Creates a new instance linked to an external cancellation token.
     pub fn with_cancellation_token(token: Option<&Arc<AtomicBool>>) -> Self {
-        let cancelled = if let Some(t) = token {
-            AtomicBool::new(t.load(Ordering::Acquire))
-        } else {
-            AtomicBool::new(false)
-        };
+        let cancelled = token
+            .map(|token| token.load(Ordering::Acquire))
+            .unwrap_or(false);
         Self {
             total_tasks: AtomicUsize::new(0),
             completed_tasks: AtomicUsize::new(0),
@@ -128,22 +130,37 @@ impl InspectionProgress {
             total_bytes: AtomicU64::new(0),
             percentage: AtomicU8::new(0),
             stage_id: AtomicU8::new(0),
-            cancelled,
+            cancelled: AtomicBool::new(cancelled),
+            cancellation_token: token.cloned(),
         }
     }
 
+    #[inline]
+    fn task_completion_percentage(completed: usize, total: usize) -> u8 {
+        if total == 0 {
+            return 0;
+        }
+
+        ((completed.min(total) as u128 * 100) / total as u128) as u8
+    }
+
     /// Returns the current completion percentage as a floating-point value `[0.0, 100.0]`.
-    /// Low-cost lock-free operation based on atomic loads with Relaxed ordering.
+    ///
+    /// When a task plan is configured, this is calculated from completed and total tasks.
+    /// The operation uses only atomic loads and never blocks inspection workers.
     #[inline]
     pub fn completion_percentage(&self) -> f32 {
-        let pct = self.percentage.load(Ordering::Relaxed);
         let total = self.total_tasks.load(Ordering::Relaxed);
-        if total > 0 {
-            let done = self.completed_tasks.load(Ordering::Relaxed);
-            let calc = (done as f32 / total as f32) * 100.0;
-            calc.clamp(pct as f32, 100.0)
+        if total == 0 {
+            return self.percentage.load(Ordering::Relaxed) as f32;
+        }
+
+        let completed = self.completed_tasks.load(Ordering::Relaxed);
+        if completed >= total {
+            100.0
         } else {
-            (pct.min(100)) as f32
+            // Keep a partially cancelled batch below 100% even when f32 rounding is coarse.
+            (((completed as f64 / total as f64) * 100.0).min(99.999_99)) as f32
         }
     }
 
@@ -151,12 +168,20 @@ impl InspectionProgress {
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self
+                .cancellation_token
+                .as_ref()
+                .map(|token| token.load(Ordering::Acquire))
+                .unwrap_or(false)
     }
 
-    /// Signals cancellation of the analysis (Release).
+    /// Signals cancellation of the analysis and its linked token, if any (Release).
     #[inline]
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        if let Some(token) = &self.cancellation_token {
+            token.store(true, Ordering::Release);
+        }
     }
 
     /// Sets the global progress percentage (0..=100).
@@ -201,6 +226,20 @@ impl InspectionProgress {
         self.total_bytes.load(Ordering::Relaxed)
     }
 
+    /// Resets the aggregate metrics before a new inspection batch starts.
+    ///
+    /// The cancellation state remains linked to its configured token, so a token that was
+    /// already cancelled still prevents a new batch from starting work.
+    pub(crate) fn reset_for_batch(&self, total: usize) {
+        self.completed_tasks.store(0, Ordering::Relaxed);
+        self.bytes_processed.store(0, Ordering::Relaxed);
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.percentage.store(0, Ordering::Relaxed);
+        self.stage_id.store(0, Ordering::Relaxed);
+        self.cancelled.store(false, Ordering::Release);
+        self.total_tasks.store(total, Ordering::Relaxed);
+    }
+
     /// Configures the total number of estimated tasks in the work plan.
     #[inline]
     pub fn set_total_tasks(&self, total: usize) {
@@ -216,7 +255,17 @@ impl InspectionProgress {
     /// Increments the completed-tasks counter by one.
     #[inline]
     pub fn increment_completed_tasks(&self) {
-        self.completed_tasks.fetch_add(1, Ordering::Relaxed);
+        let completed = self
+            .completed_tasks
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let total = self.total_tasks.load(Ordering::Relaxed);
+        if total > 0 {
+            self.percentage.store(
+                Self::task_completion_percentage(completed, total),
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// Returns the number of tasks completed so far.
@@ -225,16 +274,24 @@ impl InspectionProgress {
         self.completed_tasks.load(Ordering::Relaxed)
     }
 
-    /// Returns an immutable snapshot of the progress state.
+    /// Returns an immutable snapshot of the progress state without taking locks.
     pub fn snapshot(&self) -> ProgressSnapshot {
+        let total_tasks = self.total_tasks.load(Ordering::Relaxed);
+        let completed_tasks = self.completed_tasks.load(Ordering::Relaxed);
+        let percentage = if total_tasks > 0 {
+            Self::task_completion_percentage(completed_tasks, total_tasks)
+        } else {
+            self.percentage.load(Ordering::Relaxed)
+        };
+
         ProgressSnapshot {
-            percentage: self.percentage.load(Ordering::Relaxed),
+            percentage,
             stage_id: self.stage_id.load(Ordering::Relaxed),
-            completed_tasks: self.completed_tasks.load(Ordering::Relaxed),
-            total_tasks: self.total_tasks.load(Ordering::Relaxed),
+            completed_tasks,
+            total_tasks,
             bytes_processed: self.bytes_processed.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.load(Ordering::Relaxed),
-            cancelled: self.cancelled.load(Ordering::Acquire),
+            cancelled: self.is_cancelled(),
         }
     }
 }
@@ -421,21 +478,6 @@ pub struct BatchResult {
     pub errors: Vec<ImageInspectionError>,
 }
 
-/// Lightweight batch progress event intended for GUI/IPC consumers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchProgressEvent {
-    /// Image that most recently completed.
-    pub path: PathBuf,
-    /// Number of completed images, including failures.
-    pub completed: usize,
-    /// Number of images scheduled in the batch.
-    pub total: usize,
-    /// Integer completion percentage.
-    pub percentage: u8,
-    /// Current high-level stage.
-    pub stage: String,
-}
-
 /// Complete and consolidated inspection report of the virtual disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InspectionReport {
@@ -477,6 +519,21 @@ impl InspectionReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_cancellation_token_is_visible_in_snapshots() {
+        let token = Arc::new(AtomicBool::new(false));
+        let progress = InspectionProgress::with_cancellation_token(Some(&token));
+
+        token.store(true, Ordering::Release);
+        assert!(progress.is_cancelled());
+        assert!(progress.snapshot().cancelled);
+
+        let token = Arc::new(AtomicBool::new(false));
+        let progress = InspectionProgress::with_cancellation_token(Some(&token));
+        progress.cancel();
+        assert!(token.load(Ordering::Acquire));
+    }
 
     #[test]
     fn test_options_defaults() {

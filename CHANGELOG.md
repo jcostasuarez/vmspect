@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.8.0] - 2026-09-11
+
+### Breaking Changes
+- Removed the batch progress callback and its event type. Poll
+  `InspectionEngine::progress()` while `inspect_batch` runs instead.
+
+### Changed
+- Batch progress now resets for every `inspect_batch` call and derives its percentage from
+  completed and scheduled image counts.
+
 ## [0.7.0] - 2026-09-11
 
 ### Added

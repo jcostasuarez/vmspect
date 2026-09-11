@@ -1,6 +1,6 @@
 [package]
 name = "vmspect"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["vmspect maintainers"]
 description = "Blazing-fast static inspection, forensic analysis and information extraction library for virtual machine disk images (VMDK, RAW, QCOW2, VHD, VHDX, VDI)."

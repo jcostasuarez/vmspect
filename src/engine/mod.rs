@@ -2,8 +2,8 @@
 
 use crate::error::{Result, VmSpectError};
 use crate::models::options::{
-    BatchProgressEvent, BatchResult, ImageInspectionError, InspectionProgress,
-    InspectionProgressEvent, InspectionSummary, Options,
+    BatchResult, ImageInspectionError, InspectionProgress, InspectionProgressEvent,
+    InspectionSummary, Options,
 };
 use crate::models::traits::AnalysisResult;
 use crate::models::InspectionReport;
@@ -15,10 +15,11 @@ use crate::vms::stream::{identify_image, validate_vmdk_components, DiskReader};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Concurrent processor with Graceful Shutdown support and lock-free progress reporting.
 pub struct ConcurrentProcessor;
@@ -189,12 +190,29 @@ impl ConcurrentProcessor {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct BatchTestPause {
+    entered: Arc<Barrier>,
+    resume: Arc<Barrier>,
+}
+
+#[cfg(test)]
+impl BatchTestPause {
+    fn wait(&self) {
+        self.entered.wait();
+        self.resume.wait();
+    }
+}
+
 /// Inspection engine with concurrency support, lock-free metrics and clean shutdown (Graceful Shutdown).
 #[derive(Debug, Clone)]
 pub struct InspectionEngine {
     options: Options,
     progress: Arc<InspectionProgress>,
     cancel_token: Arc<AtomicBool>,
+    #[cfg(test)]
+    batch_test_pause: Option<Arc<BatchTestPause>>,
 }
 
 impl Default for InspectionEngine {
@@ -222,6 +240,8 @@ impl InspectionEngine {
             options,
             progress,
             cancel_token,
+            #[cfg(test)]
+            batch_test_pause: None,
         }
     }
 
@@ -230,9 +250,10 @@ impl InspectionEngine {
         Self::new(options)
     }
 
-    /// Returns a shared reference to the atomic progress structure ([`InspectionProgress`]).
+    /// Returns the shared atomic progress structure ([`InspectionProgress`]).
     ///
-    /// Allows clients (GUI/CLI/services) to query metrics and percentage in a lock-free way.
+    /// Call this before [`Self::inspect_batch`] and poll the returned [`Arc`] from a GUI, service,
+    /// or timer. Snapshot and counter reads use atomics and do not block inspection workers.
     pub fn progress(&self) -> Arc<InspectionProgress> {
         self.progress.clone()
     }
@@ -293,46 +314,25 @@ impl InspectionEngine {
     /// Inspects a set of disk images without allowing one image failure to abort the batch.
     ///
     /// Successful reports and per-image errors preserve input order. Cancellation stops accepting
-    /// new paths while retaining all results completed before and during shutdown.
+    /// new paths while retaining all results completed before and during shutdown. Obtain
+    /// [`InspectionProgress`] with [`Self::progress`] before starting this method, then poll its
+    /// lock-free [`InspectionProgress::snapshot`] or task counters from another thread or task.
+    /// Each image that finishes, including one that returns an error, increments
+    /// `completed_tasks`. Batch progress aggregates image counts; its stage and byte fields are
+    /// reset for the batch but are not aggregated from individual workers. This method never
+    /// invokes user callbacks or UI/IPC code.
     pub fn inspect_batch<P: AsRef<Path> + Send + 'static>(
         &self,
         paths: Vec<P>,
         max_workers: usize,
     ) -> Result<BatchResult> {
-        self.inspect_batch_inner(paths, max_workers, None)
-    }
-
-    /// Inspects a batch and sends lightweight completion events through a bounded, non-blocking
-    /// channel. At most one event is delivered every 250 ms; the final state is always delivered.
-    pub fn inspect_batch_with_progress<P, F>(
-        &self,
-        paths: Vec<P>,
-        max_workers: usize,
-        mut callback: F,
-    ) -> Result<BatchResult>
-    where
-        P: AsRef<Path> + Send + 'static,
-        F: FnMut(BatchProgressEvent),
-    {
-        self.inspect_batch_inner(paths, max_workers, Some(&mut callback))
-    }
-
-    fn inspect_batch_inner<P>(
-        &self,
-        paths: Vec<P>,
-        max_workers: usize,
-        mut callback: Option<&mut dyn FnMut(BatchProgressEvent)>,
-    ) -> Result<BatchResult>
-    where
-        P: AsRef<Path> + Send + 'static,
-    {
         let _guard = acquire_active_operation()?;
         let paths = paths
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
             .collect::<Vec<_>>();
         let total = paths.len();
-        self.progress.set_total_tasks(total);
+        self.progress.reset_for_batch(total);
         if total == 0 {
             return Ok(BatchResult {
                 reports: Vec::new(),
@@ -346,10 +346,9 @@ impl InspectionEngine {
         let outcomes = Arc::new(Mutex::new(Vec::with_capacity(total)));
         let options = self.options.clone();
         let cancel = self.cancel_token.clone();
-        // Capacity one intentionally coalesces bursty worker completion updates. Workers use
-        // try_send and never wait for a GUI/IPC consumer.
-        let (progress_sender, progress_receiver) = mpsc::sync_channel(1);
         let progress = self.progress.clone();
+        #[cfg(test)]
+        let batch_test_pause = self.batch_test_pause.clone();
         let workers = max_workers.max(1).min(total).min(32);
         let mut handles = Vec::with_capacity(workers);
         for worker_id in 0..workers {
@@ -358,11 +357,15 @@ impl InspectionEngine {
             let options = options.clone();
             let cancel = cancel.clone();
             let progress = progress.clone();
-            let progress_sender = progress_sender.clone();
-            handles.push(
-                std::thread::Builder::new()
-                    .name(format!("vmspect-batch-{worker_id}"))
-                    .spawn(move || loop {
+            #[cfg(test)]
+            let batch_test_pause = batch_test_pause.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("vmspect-batch-{worker_id}"))
+                .spawn(move || {
+                    #[cfg(test)]
+                    let mut batch_test_pause = batch_test_pause;
+
+                    loop {
                         if cancel.load(Ordering::Acquire) {
                             break;
                         }
@@ -374,80 +377,51 @@ impl InspectionEngine {
                         if cancel.load(Ordering::Acquire) {
                             break;
                         }
+
                         let result = InspectionEngine::new(options.clone()).inspect(&path);
-                        progress.increment_completed_tasks();
-                        let completed = progress.completed_tasks();
-                        let _ = progress_sender.try_send(BatchProgressEvent {
-                            path: path.clone(),
-                            completed,
-                            total,
-                            percentage: ((completed * 100) / total) as u8,
-                            stage: "Image inspection completed".to_string(),
-                        });
                         outcomes
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push((index, path, result));
-                    })
-                    .map_err(VmSpectError::Io)?,
-            );
-        }
-        drop(progress_sender);
-        let mut last_progress = None;
-        let mut last_emit = Instant::now() - Duration::from_millis(250);
-        loop {
-            match progress_receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(event) => last_progress = Some(event),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if let (Some(event), Some(callback)) = (last_progress.take(), callback.as_mut()) {
-                if last_emit.elapsed() >= Duration::from_millis(250) {
-                    last_emit = Instant::now();
-                    callback(event);
-                } else {
-                    last_progress = Some(event);
+                        progress.increment_completed_tasks();
+                        #[cfg(test)]
+                        if let Some(pause) = batch_test_pause.take() {
+                            pause.wait();
+                        }
+                    }
+                });
+
+            match handle {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(VmSpectError::Io(error));
                 }
             }
         }
+
         for handle in handles {
             let _ = handle.join();
         }
+
         let mut outcomes = Arc::try_unwrap(outcomes)
             .map(|outcomes| outcomes.into_inner().unwrap_or_else(|e| e.into_inner()))
             .unwrap_or_else(|outcomes| {
                 std::mem::take(&mut *outcomes.lock().unwrap_or_else(|e| e.into_inner()))
             });
         outcomes.sort_by_key(|(index, _, _)| *index);
+
         let mut reports = Vec::new();
         let mut errors = Vec::new();
-        let mut last_event = last_progress.map(|event| event.path);
         for (_, path, outcome) in outcomes {
             match outcome {
                 Ok(report) => reports.push(report),
-                Err(error) => errors.push(ImageInspectionError {
-                    path: path.clone(),
-                    error,
-                }),
+                Err(error) => errors.push(ImageInspectionError { path, error }),
             }
-            last_event = Some(path);
         }
-        if let (Some(path), Some(callback)) = (last_event, callback.as_mut()) {
-            let completed = reports.len() + errors.len();
-            // The final consolidated event is part of the API contract, including when the
-            // last worker event already reflected the same completion count.
-            let remaining = Duration::from_millis(250).saturating_sub(last_emit.elapsed());
-            if !remaining.is_zero() {
-                std::thread::sleep(remaining);
-            }
-            callback(BatchProgressEvent {
-                path,
-                completed,
-                total,
-                percentage: ((completed * 100) / total) as u8,
-                stage: "Batch completed".to_string(),
-            });
-        }
+
         Ok(BatchResult { reports, errors })
     }
 
@@ -568,7 +542,14 @@ impl InspectionEngine {
             &reader,
             Some(self.cancel_token.clone()),
             Some(self.progress.clone()),
-        )?;
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted && self.is_cancelled() {
+                VmSpectError::Cancelled
+            } else {
+                VmSpectError::Io(error)
+            }
+        })?;
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
@@ -689,6 +670,7 @@ mod tests {
         prog.increment_completed_tasks();
         assert_eq!(prog.completed_tasks(), 2);
         assert_eq!(prog.total_tasks(), 10);
+        assert_eq!(prog.completion_percentage(), 20.0);
 
         prog.add_bytes_processed(2048);
         assert_eq!(prog.bytes_processed(), 2048);
@@ -700,13 +682,22 @@ mod tests {
         assert_eq!(prog.stage_id(), 3);
 
         let snap = prog.snapshot();
-        assert_eq!(snap.percentage, 50);
+        assert_eq!(snap.percentage, 20);
         assert_eq!(snap.stage_id, 3);
         assert_eq!(snap.completed_tasks, 2);
         assert_eq!(snap.total_tasks, 10);
         assert_eq!(snap.bytes_processed, 2048);
         assert_eq!(snap.total_bytes, 4096);
         assert!(!snap.cancelled);
+
+        prog.reset_for_batch(4);
+        let reset = prog.snapshot();
+        assert_eq!(reset.percentage, 0);
+        assert_eq!(reset.stage_id, 0);
+        assert_eq!(reset.completed_tasks, 0);
+        assert_eq!(reset.total_tasks, 4);
+        assert_eq!(reset.bytes_processed, 0);
+        assert_eq!(reset.total_bytes, 0);
 
         prog.cancel();
         assert!(prog.is_cancelled());
@@ -792,6 +783,7 @@ mod tests {
 
     #[test]
     fn test_batch_collects_image_errors_in_input_order() {
+        let _operation_lock = crate::operation::lock_test_operation();
         let engine = InspectionEngine::new(Options::default());
         let result = engine
             .inspect_batch(vec!["missing-first.vmdk", "missing-second.vmdk"], 2)
@@ -801,6 +793,92 @@ mod tests {
         assert!(result.errors[0].path.ends_with("missing-first.vmdk"));
         assert!(result.errors[1].path.ends_with("missing-second.vmdk"));
         assert_eq!(engine.progress().completed_tasks(), 2);
+    }
+
+    #[test]
+    fn test_batch_progress_can_be_polled_while_running_and_is_monotonic() {
+        let _operation_lock = crate::operation::lock_test_operation();
+        let pause = Arc::new(BatchTestPause {
+            entered: Arc::new(Barrier::new(2)),
+            resume: Arc::new(Barrier::new(2)),
+        });
+        let mut engine = InspectionEngine::new(Options::default());
+        engine.batch_test_pause = Some(pause.clone());
+        let engine = Arc::new(engine);
+        let progress = engine.progress();
+        let worker_engine = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            worker_engine.inspect_batch(
+                vec!["missing-poll-first.vmdk", "missing-poll-second.vmdk"],
+                1,
+            )
+        });
+
+        pause.entered.wait();
+        let first = progress.snapshot();
+        let second = progress.snapshot();
+        assert!(!handle.is_finished());
+        assert_eq!(first.total_tasks, 2);
+        assert_eq!(first.completed_tasks, 1);
+        assert_eq!(first.percentage, 50);
+        assert_eq!(progress.completion_percentage(), 50.0);
+        assert!(second.completed_tasks >= first.completed_tasks);
+        assert!(second.percentage >= first.percentage);
+
+        pause.resume.wait();
+        let batch = handle
+            .join()
+            .expect("batch worker thread panicked")
+            .expect("batch inspection succeeds despite image errors");
+        let final_snapshot = progress.snapshot();
+        assert_eq!(batch.reports.len(), 0);
+        assert_eq!(batch.errors.len(), 2);
+        assert!(final_snapshot.completed_tasks >= second.completed_tasks);
+        assert_eq!(final_snapshot.total_tasks, 2);
+        assert_eq!(final_snapshot.completed_tasks, 2);
+        assert_eq!(final_snapshot.percentage, 100);
+        assert_eq!(progress.completion_percentage(), 100.0);
+    }
+
+    #[test]
+    fn test_batch_cancellation_preserves_partial_progress() {
+        let _operation_lock = crate::operation::lock_test_operation();
+        let pause = Arc::new(BatchTestPause {
+            entered: Arc::new(Barrier::new(2)),
+            resume: Arc::new(Barrier::new(2)),
+        });
+        let mut engine = InspectionEngine::new(Options::default());
+        engine.batch_test_pause = Some(pause.clone());
+        let engine = Arc::new(engine);
+        let progress = engine.progress();
+        let worker_engine = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            worker_engine.inspect_batch(
+                vec!["missing-cancel-first.vmdk", "missing-cancel-second.vmdk"],
+                1,
+            )
+        });
+
+        pause.entered.wait();
+        let partial = progress.snapshot();
+        assert_eq!(partial.total_tasks, 2);
+        assert_eq!(partial.completed_tasks, 1);
+        assert_eq!(partial.percentage, 50);
+
+        engine.cancel();
+        pause.resume.wait();
+        let batch = handle
+            .join()
+            .expect("batch worker thread panicked")
+            .expect("cancellation preserves completed batch outcomes");
+        let final_snapshot = progress.snapshot();
+        assert!(final_snapshot.cancelled);
+        assert_eq!(batch.reports.len(), 0);
+        assert_eq!(batch.errors.len(), 1);
+        assert_eq!(final_snapshot.total_tasks, 2);
+        assert_eq!(final_snapshot.completed_tasks, 1);
+        assert_eq!(final_snapshot.percentage, 50);
+        assert_eq!(progress.completion_percentage(), 50.0);
     }
 
     #[test]

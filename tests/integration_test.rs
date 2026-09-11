@@ -19,6 +19,12 @@ fn write_fixture_image(path: &std::path::Path) {
     std::fs::write(path, bytes).unwrap();
 }
 
+fn missing_paths(directory: &std::path::Path, count: usize) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| directory.join(format!("missing-{index}.raw")))
+        .collect()
+}
+
 #[test]
 fn configurable_discovery_and_summary_are_public() {
     let _guard = test_operation_guard();
@@ -59,13 +65,19 @@ fn tolerant_batch_preserves_reports_errors_and_json_shape() {
     let missing = tempdir.path().join("fixture-vm.raw");
     write_fixture_image(&valid);
 
-    let batch = InspectionEngine::new(Options::default())
+    let engine = InspectionEngine::new(Options::default());
+    let batch = engine
         .inspect_batch(vec![valid.clone(), missing.clone()], 2)
         .unwrap();
     assert_eq!(batch.reports.len(), 1);
     assert_eq!(batch.errors.len(), 1);
     assert_eq!(batch.reports[0].image.path, valid);
     assert_eq!(batch.errors[0].path, missing);
+
+    let progress = engine.progress().snapshot();
+    assert_eq!(progress.total_tasks, 2);
+    assert_eq!(progress.completed_tasks, 2);
+    assert_eq!(progress.percentage, 100);
 
     let json = serde_json::to_value(&batch).unwrap();
     assert!(json["reports"].is_array());
@@ -81,23 +93,25 @@ fn tolerant_batch_preserves_reports_errors_and_json_shape() {
 }
 
 #[test]
-fn batch_progress_is_lightweight_and_works_with_errors() {
+fn batch_progress_resets_when_engine_is_reused() {
     let _guard = test_operation_guard();
     let tempdir = tempfile::tempdir().unwrap();
-    let valid = tempdir.path().join("sample-vm.raw");
-    let missing = tempdir.path().join("fixture-vm.raw");
-    write_fixture_image(&valid);
-    let mut events = Vec::new();
+    let engine = InspectionEngine::new(Options::default());
 
-    let batch = InspectionEngine::new(Options::default())
-        .inspect_batch_with_progress(vec![valid, missing], 1, |event| events.push(event))
+    let first = engine
+        .inspect_batch(missing_paths(tempdir.path(), 1), 1)
         .unwrap();
-    assert_eq!(batch.reports.len() + batch.errors.len(), 2);
-    assert!(!events.is_empty());
-    assert_eq!(events.last().unwrap().stage, "Batch completed");
-    let event_json = serde_json::to_value(events.last().unwrap()).unwrap();
-    assert!(event_json.get("installed_programs").is_none());
-    assert!(event_json.get("reports").is_none());
+    assert_eq!(first.errors.len(), 1);
+    assert_eq!(engine.progress().snapshot().completed_tasks, 1);
+
+    let second = engine
+        .inspect_batch(missing_paths(tempdir.path(), 2), 1)
+        .unwrap();
+    let snapshot = engine.progress().snapshot();
+    assert_eq!(second.errors.len(), 2);
+    assert_eq!(snapshot.total_tasks, 2);
+    assert_eq!(snapshot.completed_tasks, 2);
+    assert_eq!(snapshot.percentage, 100);
 }
 
 #[test]
@@ -113,6 +127,11 @@ fn cancellation_keeps_completed_batch_outcomes() {
     let batch = engine.inspect_batch(vec![first, second], 1).unwrap();
     assert!(batch.reports.is_empty());
     assert!(batch.errors.is_empty());
+    let snapshot = engine.progress().snapshot();
+    assert_eq!(snapshot.total_tasks, 2);
+    assert_eq!(snapshot.completed_tasks, 0);
+    assert_eq!(snapshot.percentage, 0);
+    assert!(snapshot.cancelled);
 }
 
 #[test]

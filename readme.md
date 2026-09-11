@@ -35,7 +35,7 @@ It can examine partition-table structures (MBR/GPT), identify the guest operatin
   - Default, complete collection of all applications and system information without noise filters or proprietary categorizations.
   - Support for `--no-apps` (disables application collection) and `--no-system` (disables OS metadata collection) flags.
 - **Designed for UI and CLI:**
-  - Emits lightweight, rate-limited batch progress events without report or program data.
+  - Exposes lock-free batch progress snapshots for external polling without report or program data.
   - Cancellation support via atomic tokens (`Arc<AtomicBool>` / `CancellationToken`) while preserving partial results.
   - Directory discovery is explicit and configurable with exclusions and a maximum depth. Initial directory results skip installed-program extraction; use `--full-report` or a full inspection when that data is required.
   - `qemu-nbd` sessions are limited process-wide (default: two); native readers do not consume a session.
@@ -100,7 +100,8 @@ vmspect/
 ├── tests/                   # Integration tests
 │   └── integration_test.rs
 └── examples/                # Ready-to-run usage examples
-    └── basic_inspection.rs
+    ├── basic_inspection.rs
+    └── batch_polling.rs
 ```
 
 ---
@@ -111,7 +112,7 @@ Add `vmspect` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vmspect = "0.5.1"
+vmspect = "0.8.0"
 ```
 
 ---
@@ -188,39 +189,55 @@ assert!(!light_options.should_analyze_apps());
 assert!(light_options.should_analyze_system());
 ```
 
-### 3. Concurrent Processing and Result Preservation on Cancellation
+### 3. Concurrent Batch Processing with Polling
 
-`ConcurrentProcessor` and `InspectionEngine` provide clean shutdown (Graceful Shutdown) with **partial-result preservation**. When the cancellation token is triggered, worker threads do not accept new images, safely finish the in-progress analysis and return all successfully processed reports:
+`InspectionEngine::inspect_batch` never calls UI, IPC, serialization, or user callback code.
+Obtain `engine.progress()` before starting the batch and poll its atomic snapshot from a
+separate thread, task, or timer. Reading progress does not block workers. A cancelled batch
+can finish with `completed_tasks < total_tasks`, so the worker handle also determines when to
+stop polling.
 
 ```rust
 use std::path::PathBuf;
-use vmspect::prelude::*;
+use std::sync::Arc;
+use std::time::Duration;
+use vmspect::{InspectionEngine, Options};
 
-fn main() -> Result<()> {
-    let paths = vec![
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let images = vec![
         PathBuf::from("srv1.vmdk"),
         PathBuf::from("srv2.raw"),
         PathBuf::from("srv3.qcow2"),
         PathBuf::from("srv4.vhdx"),
     ];
 
-    let cancel = CancellationToken::new();
-    let options = Options::default()
-        .with_cancellation_token(&cancel);
+    let engine = Arc::new(InspectionEngine::new(Options::default()));
+    let progress = engine.progress();
 
-    let engine = InspectionEngine::new(options);
+    let worker_engine = Arc::clone(&engine);
+    let handle = std::thread::spawn(move || worker_engine.inspect_batch(images, 2));
 
-    // Cancel at any time from another thread or callback:
-    // cancel.cancel();
+    loop {
+        let snapshot = progress.snapshot();
+        let percentage = progress.completion_percentage();
+        let completed = progress.completed_tasks();
+        let total = progress.total_tasks();
 
-    // Returns completed reports and per-image errors without aborting the batch:
-    let batch = engine.inspect_batch(paths, 2)?;
+        // Update the external UI with `snapshot`. Poll every 250-500 ms.
+        println!("[{percentage:>5.1}%] {completed}/{total}");
 
-    println!("Total reports recovered: {}", batch.reports.len());
-    for r in &batch.reports {
-        println!(" - {} (OS: {:?})", r.image.path.display(), r.operating_system);
+        // `is_finished` also handles empty and partially cancelled batches.
+        if handle.is_finished()
+            || (snapshot.total_tasks > 0 && snapshot.completed_tasks >= snapshot.total_tasks)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 
+    let result = handle.join().expect("worker thread panicked")?;
+    println!("Total reports recovered: {}", result.reports.len());
+    println!("Image errors: {}", result.errors.len());
     Ok(())
 }
 ```
@@ -237,25 +254,41 @@ contains summaries unless `--full-report` is explicitly supplied.
 
 ### 4. Tauri / Async Runtime Integration
 
+Run `inspect_batch` in `tauri::async_runtime::spawn_blocking`. Keep an
+`Arc<InspectionEngine>` in managed application state, expose a lightweight independent command
+that returns `engine.progress().snapshot()`, and have the frontend invoke that command from a
+250-500 ms timer. Do not emit events from the inspection worker.
+
 ```rust,ignore
-use tauri::Emitter;
-use vmspect::{inspect_with_progress, InspectionReport, InspectionProgressEvent, Options};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::State;
+use vmspect::{BatchResult, InspectionEngine, Options, ProgressSnapshot};
+
+struct InspectionState {
+    engine: Arc<InspectionEngine>,
+}
 
 #[tauri::command]
-async fn inspect_vm(app_handle: tauri::AppHandle, path: String) -> Result<InspectionReport, String> {
-    let path = std::path::PathBuf::from(path);
-    let options = Options::default();
+async fn inspect_vms(
+    state: State<'_, InspectionState>,
+    paths: Vec<PathBuf>,
+) -> Result<BatchResult, String> {
+    let engine = Arc::clone(&state.engine);
+    tauri::async_runtime::spawn_blocking(move || engine.inspect_batch(paths, 2))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
 
-    tauri::async_runtime::spawn_blocking(move || {
-        inspect_with_progress(&path, &options, |p: InspectionProgressEvent| {
-            let _ = app_handle.emit("inspection_progress", p);
-        })
-        .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+#[tauri::command]
+fn inspection_progress(state: State<'_, InspectionState>) -> ProgressSnapshot {
+    state.engine.progress().snapshot()
 }
 ```
+
+The UI polls `inspection_progress` independently while `inspect_vms` runs. The inspection
+worker neither emits Tauri events nor serializes progress payloads.
 
 ---
 

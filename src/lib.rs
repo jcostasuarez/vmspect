@@ -45,32 +45,52 @@
 //! }
 //! ```
 //!
-//! ## Concurrent Processing with Cancellation and Partial Results
+//! ## Concurrent Batch Processing with Polling
+//!
+//! Obtain the shared [`InspectionProgress`] before starting the batch. Its reads use atomics, so
+//! an external UI, service, or timer can poll it without blocking inspection workers. The worker
+//! handle is also checked below because a cancelled batch may finish with
+//! `completed_tasks < total_tasks`.
 //!
 //! ```rust,no_run
 //! use std::path::PathBuf;
-
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
 //! use vmspect::prelude::*;
 //!
 //! fn main() -> Result<()> {
-//!     let paths = vec![
+//!     let images = vec![
 //!         PathBuf::from("vm1.vmdk"),
 //!         PathBuf::from("vm2.raw"),
 //!         PathBuf::from("vm3.qcow2"),
 //!     ];
 //!
-//!     let cancel = CancellationToken::new();
-//!     let options = Options::default().with_cancellation_token(&cancel);
-//!     let engine = InspectionEngine::new(options);
+//!     let engine = Arc::new(InspectionEngine::new(Options::default()));
+//!     let progress = engine.progress();
 //!
-//!     // Cancellation can be requested from any thread:
-//!     // cancel.cancel();
+//!     let worker_engine = Arc::clone(&engine);
+//!     let handle = std::thread::spawn(move || worker_engine.inspect_batch(images, 2));
 //!
-//!     // Returns successful reports and per-image errors, preserving input order.
-//!     let batch = engine.inspect_batch(paths, 2)?;
-//!     println!("Preserved reports: {}", batch.reports.len());
-//!     println!("Image errors: {}", batch.errors.len());
+//!     loop {
+//!         let snapshot = progress.snapshot();
+//!         let percentage = progress.completion_percentage();
+//!         let completed = progress.completed_tasks();
+//!         let total = progress.total_tasks();
 //!
+//!         println!("[{percentage:>5.1}%] {completed}/{total}");
+//!         // Update the external UI from this polling task, every 250-500 ms.
+//!         if handle.is_finished()
+//!             || (snapshot.total_tasks > 0 && snapshot.completed_tasks >= snapshot.total_tasks)
+//!         {
+//!             break;
+//!         }
+//!         std::thread::sleep(Duration::from_millis(500));
+//!     }
+//!
+//!     let result = handle.join().expect("worker thread panicked")?;
+//!     println!("Preserved reports: {}", result.reports.len());
+//!     println!("Image errors: {}", result.errors.len());
 //!     Ok(())
 //! }
 //! ```
@@ -94,11 +114,10 @@ pub use crate::vms::stream::VirtualDisk;
 pub use engine::{ConcurrentProcessor, InspectionEngine};
 pub use error::{Result, VmSpectError};
 pub use models::{
-    format_bytes, AnalysisResult, BatchProgressEvent, BatchResult, CancellationToken, FileSystem,
-    GuestInfo, GuestTools, Hypervisor, ImageInfo, ImageInspectionError, InspectionOptions,
-    InspectionProgress, InspectionProgressEvent, InspectionReport, InspectionSummary, MemoryMapper,
-    OperatingSystem, Options, OsInspector, Partition, PartitionScheme, Program, ProgressSnapshot,
-    Stats, VmDriver,
+    format_bytes, AnalysisResult, BatchResult, CancellationToken, FileSystem, GuestInfo,
+    GuestTools, Hypervisor, ImageInfo, ImageInspectionError, InspectionOptions, InspectionProgress,
+    InspectionProgressEvent, InspectionReport, InspectionSummary, MemoryMapper, OperatingSystem,
+    Options, OsInspector, Partition, PartitionScheme, Program, ProgressSnapshot, Stats, VmDriver,
 };
 
 use std::path::Path;

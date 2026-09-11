@@ -34,6 +34,14 @@ struct CliConfig {
     include_system: bool,
     /// Maximum number of worker threads in concurrent mode.
     max_workers: Option<usize>,
+    /// Requests complete reports, including installed programs, for directory JSON output.
+    full_report: bool,
+    /// Directory names or paths excluded from recursive discovery.
+    excluded_directories: Vec<PathBuf>,
+    /// Maximum discovery depth, with the selected root at depth zero.
+    max_depth: Option<usize>,
+    /// Suppresses discovery warnings on stderr while retaining them in JSON output.
+    quiet_discovery: bool,
 }
 
 fn print_help() {
@@ -55,15 +63,19 @@ OPTIONS:
     --no-apps                  Skips extraction of the installed-software catalog.
     --no-system                Skips extraction of guest-OS information and metadata.
     --include-system           Also extracts the SYSTEM hive from the Registry on Windows images.
-    -w, --workers <NUM>        Maximum number of concurrent threads (default: logical CPU cores).
+    --full-report              Include installed programs in directory JSON output.
+    --exclude <DIR>            Exclude a directory path or name from recursive discovery.
+    --max-depth <NUM>          Maximum discovery depth (selected root is depth 0).
+    --quiet-discovery          Suppress discovery warnings on stderr.
+    -w, --workers <NUM>        Worker threads for a directory (default: 1 sequential, 2 concurrent).
     -h, --help                 Shows this help information.
     -V, --version              Shows the current tool version.
 
 EXAMPLES:
     vmspect disk.vmdk
     vmspect disk.qcow2 --json
-    vmspect /var/lib/libvirt/images/ --concurrent --recursive
-    vmspect C:\VMs\Windows10.vmdk --force-nbd
+    vmspect fixtures --concurrent --recursive
+    vmspect disk.vmdk --force-nbd
 "#
     );
 }
@@ -113,6 +125,29 @@ where
             "--include-system" => {
                 config.include_system = true;
             }
+            "--full-report" => {
+                config.full_report = true;
+            }
+            "--exclude" => {
+                config
+                    .excluded_directories
+                    .push(PathBuf::from(args.next().ok_or_else(|| {
+                        "A directory is required for --exclude".to_string()
+                    })?));
+            }
+            "--max-depth" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "A numeric value is required for --max-depth".to_string())?;
+                config.max_depth = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("Invalid maximum depth: '{}'", value))?,
+                );
+            }
+            "--quiet-discovery" => {
+                config.quiet_discovery = true;
+            }
             "-w" | "--workers" => {
                 let value = args
                     .next()
@@ -120,6 +155,9 @@ where
                 let num = value
                     .parse::<usize>()
                     .map_err(|_| format!("Invalid worker count: '{}'", value))?;
+                if num == 0 {
+                    return Err("Worker count must be at least 1".to_string());
+                }
                 config.max_workers = Some(num);
             }
             other if other.starts_with("--workers=") => {
@@ -127,6 +165,9 @@ where
                 let num = value
                     .parse::<usize>()
                     .map_err(|_| format!("Invalid worker count: '{}'", value))?;
+                if num == 0 {
+                    return Err("Worker count must be at least 1".to_string());
+                }
                 config.max_workers = Some(num);
             }
             other if other.starts_with('-') => {
@@ -251,17 +292,38 @@ fn run_file(path: &Path, options: &Options, json_format: bool) {
 }
 
 fn run_directory(directory: &Path, config: &CliConfig, options: &Options) {
-    let images = match list_vms(directory, config.recursive) {
-        Ok(imgs) => imgs,
-        Err(e) => {
-            eprintln!("Error listing images in '{}': {}", directory.display(), e);
+    let discovery = match list_vms_with_options(
+        directory,
+        &DiscoveryOptions {
+            recursive: config.recursive,
+            excluded_directories: config.excluded_directories.clone(),
+            emit_warnings: !config.quiet_discovery,
+            max_depth: config.max_depth,
+        },
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!(
+                "Error listing images in '{}': {}",
+                directory.display(),
+                error
+            );
             process::exit(1);
         }
     };
-
+    let images = discovery.images;
     if images.is_empty() {
         if config.json_format {
-            println!("[]");
+            let value = serde_json::json!({
+                "reports": [],
+                "errors": [],
+                "discovery_warnings": discovery.warnings,
+                "inaccessible_directories": discovery.inaccessible_directories,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&value).expect("JSON value is serializable")
+            );
         } else {
             println!(
                 "No virtual disk images were found in '{}'.",
@@ -270,126 +332,59 @@ fn run_directory(directory: &Path, config: &CliConfig, options: &Options) {
         }
         return;
     }
-
-    let max_workers = config.max_workers.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    });
-
-    if config.concurrent {
-        if !config.json_format {
-            println!("============================================================");
-            println!("  Concurrent Scan: {} images found", images.len());
-            println!("  Directory: {}", directory.display());
-            println!("  Worker threads: {}", max_workers);
-            println!("============================================================\n");
-        }
-
-        let start = Instant::now();
-        let result = ConcurrentProcessor::inspect_images(images, options, max_workers);
-
-        match result {
-            Ok(reports) => {
-                if config.json_format {
-                    match serde_json::to_string_pretty(&reports) {
-                        Ok(json) => println!("{}", json),
-                        Err(e) => {
-                            eprintln!("Error serializing JSON: {}", e);
-                            process::exit(1);
-                        }
-                    }
-                } else {
-                    for (i, report) in reports.iter().enumerate() {
-                        println!(
-                            "\n--- [Image {}/{}] ----------------------------------------",
-                            i + 1,
-                            reports.len()
-                        );
-                        print_human_report(report, report.stats.duration_ms);
-                    }
-
-                    let total_duration = start.elapsed().as_millis() as u64;
-                    println!("\n============================================================");
-                    println!("  Concurrent Batch Summary:");
-                    println!("  Total images processed: {}", reports.len());
-                    println!(
-                        "  Total elapsed time: {} ms ({:.2} s)",
-                        total_duration,
-                        total_duration as f64 / 1000.0
-                    );
-                    println!("============================================================");
-                }
-            }
-            Err(e) => {
-                eprintln!("Error during concurrent processing: {}", e);
-                process::exit(1);
-            }
-        }
-    } else {
-        // Sequential mode for the directory
-        if !config.json_format {
-            println!("============================================================");
-            println!("  Sequential Scan: {} images found", images.len());
-            println!("  Directory: {}", directory.display());
-            println!("============================================================\n");
-        }
-
-        let start = Instant::now();
-        let mut reports = Vec::with_capacity(images.len());
-
-        for (i, image_path) in images.iter().enumerate() {
-            if !config.json_format {
-                println!(
-                    "[{}/{}] Inspecting '{}'...",
-                    i + 1,
-                    images.len(),
-                    image_path.display()
-                );
-            }
-
-            let engine = InspectionEngine::new(options.clone());
-            match engine.inspect(image_path) {
-                Ok(report) => {
-                    if !config.json_format {
-                        print_human_report(&report, report.stats.duration_ms);
-                        println!();
-                    }
-                    reports.push(report);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: analysis of '{}' failed: {}",
-                        image_path.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        if config.json_format {
-            match serde_json::to_string_pretty(&reports) {
-                Ok(json) => println!("{}", json),
-                Err(e) => {
-                    eprintln!("Error serializing JSON: {}", e);
+    let workers = config
+        .max_workers
+        .unwrap_or(if config.concurrent { 2 } else { 1 })
+        .max(1);
+    let mut batch_options = options.clone();
+    // Directory discovery is an initial listing; fetch complete reports only when requested.
+    if !config.full_report {
+        batch_options.no_apps = true;
+    }
+    let start = Instant::now();
+    let result = InspectionEngine::new(batch_options).inspect_batch(images, workers);
+    match result {
+        Ok(batch) if config.json_format => {
+            let value = if config.full_report {
+                serde_json::json!({ "reports": batch.reports, "errors": batch.errors, "discovery_warnings": discovery.warnings, "inaccessible_directories": discovery.inaccessible_directories })
+            } else {
+                let summaries = batch
+                    .reports
+                    .iter()
+                    .map(InspectionReport::summary)
+                    .collect::<Vec<_>>();
+                serde_json::json!({ "reports": summaries, "errors": batch.errors, "discovery_warnings": discovery.warnings, "inaccessible_directories": discovery.inaccessible_directories })
+            };
+            match serde_json::to_string_pretty(&value) {
+                Ok(json) => println!("{json}"),
+                Err(error) => {
+                    eprintln!("Error serializing JSON: {error}");
                     process::exit(1);
                 }
             }
-        } else {
-            let total_duration = start.elapsed().as_millis() as u64;
-            println!("============================================================");
-            println!("  Sequential Scan Summary:");
+        }
+        Ok(batch) => {
+            for report in &batch.reports {
+                print_human_report(report, report.stats.duration_ms);
+            }
+            for error in &batch.errors {
+                eprintln!(
+                    "Warning: analysis of '{}': {}",
+                    error.path.display(),
+                    error.error
+                );
+            }
             println!(
-                "  Successfully completed images: {}/{}",
-                reports.len(),
-                images.len()
+                "Processed {}/{} images in {} ms with {} errors.",
+                batch.reports.len(),
+                batch.reports.len() + batch.errors.len(),
+                start.elapsed().as_millis(),
+                batch.errors.len()
             );
-            println!(
-                "  Total time: {} ms ({:.2} s)",
-                total_duration,
-                total_duration as f64 / 1000.0
-            );
-            println!("============================================================");
+        }
+        Err(error) => {
+            eprintln!("Error during batch processing: {error}");
+            process::exit(1);
         }
     }
 }
@@ -542,6 +537,40 @@ mod tests {
         let cfg = parse_args_from(args.into_iter()).unwrap();
         assert_eq!(cfg.max_workers, Some(12));
         assert_eq!(cfg.target_path, Some(PathBuf::from("disk.qcow2")));
+    }
+
+    #[test]
+    fn test_parse_discovery_and_full_report_flags() {
+        let args = vec![
+            "--exclude".to_string(),
+            "fixtures".to_string(),
+            "--exclude".to_string(),
+            "tempdir".to_string(),
+            "--max-depth".to_string(),
+            "2".to_string(),
+            "--quiet-discovery".to_string(),
+            "--full-report".to_string(),
+            "sample-vm".to_string(),
+        ];
+        let cfg = parse_args_from(args.into_iter()).unwrap();
+        assert_eq!(
+            cfg.excluded_directories,
+            vec![PathBuf::from("fixtures"), PathBuf::from("tempdir")]
+        );
+        assert_eq!(cfg.max_depth, Some(2));
+        assert!(cfg.quiet_discovery);
+        assert!(cfg.full_report);
+    }
+
+    #[test]
+    fn test_parse_rejects_incomplete_or_invalid_values() {
+        assert!(parse_args_from(vec!["--exclude".to_string()].into_iter()).is_err());
+        assert!(
+            parse_args_from(vec!["--max-depth".to_string(), "no".to_string()].into_iter()).is_err()
+        );
+        assert!(
+            parse_args_from(vec!["--workers".to_string(), "0".to_string()].into_iter()).is_err()
+        );
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Configuration options, progress events and the final inspection report.
 
+use crate::error::VmSpectError;
 use crate::models::image::{ImageInfo, Stats};
 use crate::models::partition::{OperatingSystem, Partition, PartitionScheme};
-use crate::models::software::{GuestInfo, Program};
+use crate::models::software::{GuestInfo, GuestTools, Program};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -239,7 +240,7 @@ impl InspectionProgress {
 }
 
 /// Execution options passed to the inspection engine.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     /// If `true`, disables collection of installed applications (`--no-apps`).
     pub no_apps: bool,
@@ -267,10 +268,31 @@ pub struct Options {
     /// Optional atomic cancellation token to abort the inspection early.
     #[serde(skip)]
     pub cancel_token: Option<Arc<AtomicBool>>,
+    /// Maximum simultaneous `qemu-nbd` sessions used by a batch. Native readers are not limited.
+    pub nbd_max_sessions: usize,
 }
 
 /// Alias for [`Options`] under the `InspectionOptions` naming.
 pub type InspectionOptions = Options;
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            no_apps: false,
+            no_system: false,
+            include_system: false,
+            qemu_nbd: None,
+            chunk_size: None,
+            force_nbd: false,
+            unix_socket: None,
+            extra_nbd_args: Vec::new(),
+            connection_timeout: None,
+            nbd_persistent: false,
+            cancel_token: None,
+            nbd_max_sessions: 2,
+        }
+    }
+}
 
 impl Options {
     /// Indicates whether installed-application analysis should run (returns `!self.no_apps`).
@@ -321,6 +343,12 @@ impl Options {
         self
     }
 
+    /// Sets the maximum number of simultaneous `qemu-nbd` sessions. Zero is treated as one.
+    pub fn with_nbd_max_sessions(mut self, max_sessions: usize) -> Self {
+        self.nbd_max_sessions = max_sessions.max(1);
+        self
+    }
+
     /// Assigns or replaces the atomic cancellation token.
     pub fn with_cancel_token(mut self, token: Arc<AtomicBool>) -> Self {
         self.cancel_token = Some(token);
@@ -343,6 +371,69 @@ pub struct InspectionProgressEvent {
     pub stage: String,
     /// Optional additional technical information about the progress.
     pub detail: Option<String>,
+}
+
+/// Lightweight initial view of an inspection, suitable for GUI and IPC lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectionSummary {
+    /// Path to the inspected image.
+    pub path: PathBuf,
+    /// Detected operating system.
+    pub operating_system: OperatingSystem,
+    /// Detected guest integration tools, if any.
+    pub guest_tools: Option<GuestTools>,
+    /// Inspection duration in milliseconds.
+    pub duration_ms: u64,
+    /// Read backend used during inspection.
+    pub access_mode: String,
+    /// Non-fatal inspection warnings.
+    pub warnings: Vec<String>,
+}
+
+/// Per-image error returned by a tolerant inspection batch.
+#[derive(Debug)]
+pub struct ImageInspectionError {
+    /// Path of the image that could not be inspected.
+    pub path: PathBuf,
+    /// Original inspection error.
+    pub error: VmSpectError,
+}
+
+impl Serialize for ImageInspectionError {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ImageInspectionError", 2)?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("error", &self.error.to_string())?;
+        state.end()
+    }
+}
+
+/// Successful reports and per-image failures from an inspection batch.
+#[derive(Debug, Serialize)]
+pub struct BatchResult {
+    /// Reports for images inspected successfully, in input order.
+    pub reports: Vec<InspectionReport>,
+    /// Errors for images that could not be inspected, in input order.
+    pub errors: Vec<ImageInspectionError>,
+}
+
+/// Lightweight batch progress event intended for GUI/IPC consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchProgressEvent {
+    /// Image that most recently completed.
+    pub path: PathBuf,
+    /// Number of completed images, including failures.
+    pub completed: usize,
+    /// Number of images scheduled in the batch.
+    pub total: usize,
+    /// Integer completion percentage.
+    pub percentage: u8,
+    /// Current high-level stage.
+    pub stage: String,
 }
 
 /// Complete and consolidated inspection report of the virtual disk.
@@ -369,6 +460,20 @@ pub struct InspectionReport {
     pub stats: Stats,
 }
 
+impl InspectionReport {
+    /// Produces the lightweight initial view without installed-program data.
+    pub fn summary(&self) -> InspectionSummary {
+        InspectionSummary {
+            path: self.image.path.clone(),
+            operating_system: self.operating_system,
+            guest_tools: self.guest_info.guest_tools.clone(),
+            duration_ms: self.stats.duration_ms,
+            access_mode: self.stats.access_mode.clone(),
+            warnings: self.warnings.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +485,8 @@ mod tests {
         assert!(!opts.no_system);
         assert!(opts.should_analyze_apps());
         assert!(opts.should_analyze_system());
+        assert!(!opts.force_nbd);
+        assert_eq!(opts.nbd_max_sessions, 2);
     }
 
     #[test]
@@ -400,6 +507,37 @@ mod tests {
         };
         assert!(opts.should_analyze_apps());
         assert!(!opts.should_analyze_system());
+    }
+
+    #[test]
+    fn test_summary_omits_installed_programs() {
+        let report = InspectionReport {
+            image: ImageInfo {
+                path: PathBuf::from("vm.raw"),
+                format: "raw".to_string(),
+                virtual_size: 1,
+                actual_size: 1,
+                hypervisor: crate::models::Hypervisor::Unknown,
+            },
+            scheme: PartitionScheme::None,
+            partitions: Vec::new(),
+            operating_system: OperatingSystem::Unknown,
+            guest_info: GuestInfo::default(),
+            installed_programs: vec![Program {
+                name: "secret app".to_string(),
+                ..Program::default()
+            }],
+            warnings: vec!["warning".to_string()],
+            stats: Stats {
+                access_mode: "native".to_string(),
+                duration_ms: 12,
+                ..Stats::default()
+            },
+        };
+        let summary = report.summary();
+        let json = serde_json::to_value(summary).unwrap();
+        assert!(json.get("installed_programs").is_none());
+        assert_eq!(json["path"], "vm.raw");
     }
 
     #[test]

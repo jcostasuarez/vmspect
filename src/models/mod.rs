@@ -9,8 +9,9 @@ pub mod traits;
 // Re-exports to facilitate flat access within the `models` submodule.
 pub use image::{format_bytes, Hypervisor, ImageInfo, Stats};
 pub use options::{
-    CancellationToken, InspectionOptions, InspectionProgress, InspectionProgressEvent,
-    InspectionReport, Options, ProgressSnapshot,
+    BatchProgressEvent, BatchResult, CancellationToken, ImageInspectionError, InspectionOptions,
+    InspectionProgress, InspectionProgressEvent, InspectionReport, InspectionSummary, Options,
+    ProgressSnapshot,
 };
 pub use partition::{FileSystem, OperatingSystem, Partition, PartitionScheme};
 pub use software::{GuestInfo, GuestTools, Program};

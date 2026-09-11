@@ -7,11 +7,47 @@
 //! - Pre-flight analysis to decide whether an image can be processed natively or requires `qemu-nbd`.
 
 use crate::error::{Result, VmSpectError};
+use crate::operation::acquire_active_operation;
 use crate::vms::vmdk;
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+/// Configuration for discovery below an explicitly selected root directory.
+#[derive(Debug, Clone)]
+pub struct DiscoveryOptions {
+    /// Whether discovery descends into subdirectories.
+    pub recursive: bool,
+    /// Directory paths or directory names to skip.
+    pub excluded_directories: Vec<PathBuf>,
+    /// Whether warnings are also written to stderr.
+    pub emit_warnings: bool,
+    /// Maximum depth to visit, with the supplied root defined as depth zero.
+    pub max_depth: Option<usize>,
+}
+
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        Self {
+            recursive: false,
+            excluded_directories: Vec::new(),
+            emit_warnings: true,
+            max_depth: None,
+        }
+    }
+}
+
+/// Images and non-fatal discovery diagnostics collected from a selected root directory.
+#[derive(Debug, Default, Clone)]
+pub struct DiscoveryReport {
+    /// Discovered primary image paths, sorted deterministically.
+    pub images: Vec<PathBuf>,
+    /// Non-fatal warnings produced while visiting descendants.
+    pub warnings: Vec<String>,
+    /// Descendant directories that could not be opened.
+    pub inaccessible_directories: Vec<PathBuf>,
+}
 
 /// File extensions recognized as VM disk images.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["vmdk", "qcow2", "vdi", "vhd", "vhdx", "raw", "img"];
@@ -88,7 +124,8 @@ pub fn is_secondary_extent(path: &Path) -> bool {
         for sep in &["-s", "_s"] {
             if let Some(pos) = stem.rfind(sep) {
                 let suffix = &stem[pos + sep.len()..];
-                if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                // Split extents may include a descriptive suffix after the numeric segment.
+                if suffix.chars().take_while(|c| c.is_ascii_digit()).count() > 0 {
                     return true;
                 }
             }
@@ -140,7 +177,7 @@ fn is_vm_image_candidate(path: &Path) -> bool {
 /// use std::path::Path;
 /// use vmspect::is_vm_image;
 ///
-/// assert!(is_vm_image(Path::new("ubuntu.qcow2")));
+/// assert!(is_vm_image(Path::new("sample-vm.qcow2")));
 /// assert!(is_vm_image(Path::new("disk.vmdk")));
 /// assert!(!is_vm_image(Path::new("disk-flat.vmdk")));
 /// assert!(!is_vm_image(Path::new("notes.txt")));
@@ -181,41 +218,6 @@ fn validate_discovery_root(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn warn_skipped_directory(path: &Path, error: &std::io::Error) {
-    eprintln!(
-        "Warning: skipping directory '{}' during VM discovery: {}",
-        path.display(),
-        error
-    );
-}
-
-fn warn_skipped_entry(path: &Path, error: &std::io::Error) {
-    eprintln!(
-        "Warning: skipping entry '{}' during VM discovery: {}",
-        path.display(),
-        error
-    );
-}
-
-fn warn_unreadable_entry(directory: &Path, error: &std::io::Error) {
-    eprintln!(
-        "Warning: skipping an unreadable entry in directory '{}' during VM discovery: {}",
-        directory.display(),
-        error
-    );
-}
-
-fn read_dir_or_warn(directory: &Path, root: &Path) -> Result<Option<fs::ReadDir>> {
-    match fs::read_dir(directory) {
-        Ok(entries) => Ok(Some(entries)),
-        Err(error) if directory == root => Err(VmSpectError::Io(error)),
-        Err(error) => {
-            warn_skipped_directory(directory, &error);
-            Ok(None)
-        }
-    }
-}
-
 /// Lists every VM disk image found in the supplied directory.
 ///
 /// # Parameters
@@ -242,22 +244,59 @@ fn read_dir_or_warn(directory: &Path, root: &Path) -> Result<Option<fs::ReadDir>
 /// # Ok::<(), vmspect::VmSpectError>(())
 /// ```
 pub fn list_vms(directory: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
+    list_vms_with_options(
+        directory,
+        &DiscoveryOptions {
+            recursive,
+            ..DiscoveryOptions::default()
+        },
+    )
+    .map(|report| report.images)
+}
+
+/// Lists VM images below an explicitly selected root using configurable traversal rules.
+/// The supplied root has depth zero, so `max_depth = Some(0)` visits only its direct files.
+pub fn list_vms_with_options(
+    directory: &Path,
+    options: &DiscoveryOptions,
+) -> Result<DiscoveryReport> {
+    let _guard = acquire_active_operation()?;
     validate_discovery_root(directory)?;
-
-    let mut images = Vec::new();
+    let mut report = DiscoveryReport::default();
     let mut queue = VecDeque::new();
-    queue.push_back(directory.to_path_buf());
+    queue.push_back((directory.to_path_buf(), 0usize));
 
-    while let Some(current_dir) = queue.pop_front() {
-        let Some(entries) = read_dir_or_warn(&current_dir, directory)? else {
-            continue;
+    while let Some((current_dir, depth)) = queue.pop_front() {
+        let entries = match fs::read_dir(&current_dir) {
+            Ok(entries) => entries,
+            Err(error) if current_dir == directory => return Err(VmSpectError::Io(error)),
+            Err(error) => {
+                let warning = format!(
+                    "skipping directory '{}' during VM discovery: {}",
+                    current_dir.display(),
+                    error
+                );
+                if options.emit_warnings {
+                    eprintln!("Warning: {warning}");
+                }
+                report.warnings.push(warning);
+                report.inaccessible_directories.push(current_dir);
+                continue;
+            }
         };
-
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    warn_unreadable_entry(&current_dir, &error);
+                    let warning = format!(
+                        "skipping an unreadable entry in directory '{}' during VM discovery: {}",
+                        current_dir.display(),
+                        error
+                    );
+                    if options.emit_warnings {
+                        eprintln!("Warning: {warning}");
+                    }
+                    report.warnings.push(warning);
                     continue;
                 }
             };
@@ -265,29 +304,51 @@ pub fn list_vms(directory: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
-                    warn_skipped_entry(&path, &error);
+                    let warning = format!(
+                        "skipping entry '{}' during VM discovery: {}",
+                        path.display(),
+                        error
+                    );
+                    if options.emit_warnings {
+                        eprintln!("Warning: {warning}");
+                    }
+                    report.warnings.push(warning);
                     continue;
                 }
             };
-
-            if file_type.is_dir() {
-                if recursive {
-                    queue.push_back(path);
+            if file_type.is_dir() && options.recursive {
+                let excluded = options
+                    .excluded_directories
+                    .iter()
+                    .any(|excluded| excluded == &path || excluded.file_name() == path.file_name());
+                let below_limit = options.max_depth.map(|limit| depth < limit).unwrap_or(true);
+                if !excluded && below_limit {
+                    queue.push_back((path, depth + 1));
                 }
             } else if file_type.is_file() && is_vm_image_candidate(&path) {
                 match entry.metadata() {
                     Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
-                        images.push(path);
+                        report.images.push(path)
                     }
                     Ok(_) => {}
-                    Err(error) => warn_skipped_entry(&path, &error),
+                    Err(error) => {
+                        let warning = format!(
+                            "skipping entry '{}' during VM discovery: {}",
+                            path.display(),
+                            error
+                        );
+                        if options.emit_warnings {
+                            eprintln!("Warning: {warning}");
+                        }
+                        report.warnings.push(warning);
+                    }
                 }
             }
         }
     }
-
-    images.sort();
-    Ok(images)
+    report.images.sort();
+    report.inaccessible_directories.sort();
+    Ok(report)
 }
 
 /// Counts the number of VM disk images present in the supplied directory.
@@ -324,48 +385,7 @@ pub fn count_vms(directory: &Path, recursive: bool) -> Result<usize> {
 /// or cannot be read. Errors found below the root are reported as warnings and
 /// skipped.
 pub fn has_vms(directory: &Path, recursive: bool) -> Result<bool> {
-    validate_discovery_root(directory)?;
-
-    let mut queue = VecDeque::new();
-    queue.push_back(directory.to_path_buf());
-
-    while let Some(current_dir) = queue.pop_front() {
-        let Some(entries) = read_dir_or_warn(&current_dir, directory)? else {
-            continue;
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    warn_unreadable_entry(&current_dir, &error);
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) => {
-                    warn_skipped_entry(&path, &error);
-                    continue;
-                }
-            };
-
-            if file_type.is_dir() {
-                if recursive {
-                    queue.push_back(path);
-                }
-            } else if file_type.is_file() && is_vm_image_candidate(&path) {
-                match entry.metadata() {
-                    Ok(metadata) if metadata.is_file() && metadata.len() > 0 => return Ok(true),
-                    Ok(_) => {}
-                    Err(error) => warn_skipped_entry(&path, &error),
-                }
-            }
-        }
-    }
-
-    Ok(false)
+    list_vms(directory, recursive).map(|images| !images.is_empty())
 }
 
 /// Verifies the integrity and format of a disk image by quickly inspecting its magic bytes.
@@ -608,21 +628,28 @@ mod tests {
 
     #[test]
     fn test_is_secondary_extent() {
-        assert!(is_secondary_extent(Path::new("ubuntu-flat.vmdk")));
-        assert!(is_secondary_extent(Path::new("ubuntu_flat.vmdk")));
-        assert!(is_secondary_extent(Path::new("ubuntu-delta.vmdk")));
-        assert!(is_secondary_extent(Path::new("ubuntu-sesparse.vmdk")));
-        assert!(is_secondary_extent(Path::new("windows-s001.vmdk")));
-        assert!(is_secondary_extent(Path::new("windows-s02.vmdk")));
-        assert!(is_secondary_extent(Path::new("windows_s1.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-flat.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk_flat.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-delta.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-sesparse.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-s001.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-s002.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk_s001.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-s001 - copia.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-s002_backup.vmdk")));
+        assert!(is_secondary_extent(Path::new("DISK-FLAT.VMDK")));
+        assert!(is_secondary_extent(Path::new("disk-delta.vmdk")));
+        assert!(is_secondary_extent(Path::new("disk-sesparse.vmdk")));
         assert!(is_secondary_extent(Path::new("disk-sys.vhd")));
         assert!(is_secondary_extent(Path::new("disk_sys.vhd")));
         assert!(is_secondary_extent(Path::new("disk-delta.vhd")));
         assert!(is_secondary_extent(Path::new("disk-delta.vhdx")));
 
         // Valid (not secondary)
-        assert!(!is_secondary_extent(Path::new("ubuntu.vmdk")));
-        assert!(!is_secondary_extent(Path::new("windows-server.vmdk")));
+        assert!(!is_secondary_extent(Path::new("sample-vm.vmdk")));
+        assert!(!is_secondary_extent(Path::new("server.vmdk")));
+        assert!(!is_secondary_extent(Path::new("server.vmdk")));
+        assert!(!is_secondary_extent(Path::new("snapshot.vmdk")));
         assert!(!is_secondary_extent(Path::new("disk.qcow2")));
         assert!(!is_secondary_extent(Path::new("disk.vdi")));
         assert!(!is_secondary_extent(Path::new("disk.vhd")));
@@ -712,10 +739,10 @@ mod tests {
         let sub = dir.path().join("subdir");
         fs::create_dir(&sub).unwrap();
 
-        let vm1 = dir.path().join("ubuntu.qcow2");
+        let vm1 = dir.path().join("sample-vm.qcow2");
         let vm2 = dir.path().join("disk.vmdk");
         let extent = dir.path().join("disk-flat.vmdk");
-        let vm3 = sub.join("windows.vhdx");
+        let vm3 = sub.join("fixture-vm.vhdx");
         let dummy = dir.path().join("notes.txt");
 
         File::create(&vm1).unwrap().write_all(b"data").unwrap();
@@ -744,6 +771,36 @@ mod tests {
         let empty_dir = tempdir().unwrap();
         assert_eq!(count_vms(empty_dir.path(), true).unwrap(), 0);
         assert!(!has_vms(empty_dir.path(), true).unwrap());
+    }
+
+    #[test]
+    fn test_discovery_options_exclusions_and_depth() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = first.join("second");
+        let excluded = dir.path().join("excluded");
+        fs::create_dir_all(&second).unwrap();
+        fs::create_dir(&excluded).unwrap();
+        fs::write(dir.path().join("root.raw"), b"disk").unwrap();
+        fs::write(first.join("first.raw"), b"disk").unwrap();
+        fs::write(second.join("second.raw"), b"disk").unwrap();
+        fs::write(excluded.join("hidden.raw"), b"disk").unwrap();
+        let report = list_vms_with_options(
+            dir.path(),
+            &DiscoveryOptions {
+                recursive: true,
+                excluded_directories: vec![PathBuf::from("excluded")],
+                emit_warnings: false,
+                max_depth: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.images.len(), 2);
+        assert!(report
+            .images
+            .iter()
+            .all(|path| !path.ends_with("hidden.raw")));
+        assert!(report.warnings.is_empty());
     }
 
     #[test]

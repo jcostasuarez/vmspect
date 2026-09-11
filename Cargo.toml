@@ -1,12 +1,12 @@
 [package]
 name = "vmspect"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
-authors = ["Juan"]
+authors = ["vmspect maintainers"]
 description = "Blazing-fast static inspection, forensic analysis and information extraction library for virtual machine disk images (VMDK, RAW, QCOW2, VHD, VHDX, VDI)."
 license = "MIT OR Apache-2.0"
 readme = "readme.md"
-repository = "https://github.com/jcostasuarez/vmspect"
+repository = "https://example.invalid/vmspect"
 keywords = ["vm", "vmdk", "qemu", "inspection", "forensics"]
 categories = ["filesystem", "command-line-utilities", "parser-implementations"]
 

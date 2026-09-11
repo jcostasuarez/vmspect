@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.6.0] - 2026-09-11
+
+### Breaking Changes
+- Changed `InspectionEngine::inspect_batch` to return `BatchResult`, exposing successful reports and per-image errors instead of aborting the whole batch on an individual failure.
+- Directory JSON output now uses an object containing reports, errors, discovery warnings and inaccessible directories; initial directory reports are summaries unless `--full-report` is supplied.
+
+### Added
+- Added tolerant batch inspection with ordered `BatchResult` outcomes and rate-limited `BatchProgressEvent` callbacks.
+- Added configurable VM discovery with exclusions, maximum depth and optional warning suppression.
+- Added `InspectionSummary` for lightweight GUI and IPC listings.
+- Added process-wide `qemu-nbd` session limits with a default of two concurrent sessions.
+
+### Changed
+- Directory processing now uses bounded worker defaults and avoids collecting installed applications during initial listings.
+- Improved CLI options with `--full-report`, `--exclude`, `--max-depth` and `--quiet-discovery`.
+
 ## [0.5.1] - 2026-09-09
 
 ### Changed

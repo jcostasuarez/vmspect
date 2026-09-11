@@ -1,9 +1,13 @@
 //! Concurrency processing engine, task coordination and Graceful Shutdown.
 
 use crate::error::{Result, VmSpectError};
-use crate::models::options::{InspectionProgress, InspectionProgressEvent, Options};
+use crate::models::options::{
+    BatchProgressEvent, BatchResult, ImageInspectionError, InspectionProgress,
+    InspectionProgressEvent, InspectionSummary, Options,
+};
 use crate::models::traits::AnalysisResult;
 use crate::models::InspectionReport;
+use crate::operation::acquire_active_operation;
 use crate::parsers;
 use crate::vms;
 use crate::vms::nbd::{self, NbdReader};
@@ -11,9 +15,10 @@ use crate::vms::stream::{identify_image, validate_vmdk_components, DiskReader};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Concurrent processor with Graceful Shutdown support and lock-free progress reporting.
 pub struct ConcurrentProcessor;
@@ -285,27 +290,174 @@ impl InspectionEngine {
             .map_err(VmSpectError::Io)
     }
 
-    /// Inspects a set of disk images in parallel using multiple workers.
+    /// Inspects a set of disk images without allowing one image failure to abort the batch.
     ///
-    /// Preserves results processed before and during the cancellation request.
+    /// Successful reports and per-image errors preserve input order. Cancellation stops accepting
+    /// new paths while retaining all results completed before and during shutdown.
     pub fn inspect_batch<P: AsRef<Path> + Send + 'static>(
         &self,
         paths: Vec<P>,
         max_workers: usize,
-    ) -> Result<Vec<InspectionReport>> {
+    ) -> Result<BatchResult> {
+        self.inspect_batch_inner(paths, max_workers, None)
+    }
+
+    /// Inspects a batch and sends lightweight completion events through a bounded, non-blocking
+    /// channel. At most one event is delivered every 250 ms; the final state is always delivered.
+    pub fn inspect_batch_with_progress<P, F>(
+        &self,
+        paths: Vec<P>,
+        max_workers: usize,
+        mut callback: F,
+    ) -> Result<BatchResult>
+    where
+        P: AsRef<Path> + Send + 'static,
+        F: FnMut(BatchProgressEvent),
+    {
+        self.inspect_batch_inner(paths, max_workers, Some(&mut callback))
+    }
+
+    fn inspect_batch_inner<P>(
+        &self,
+        paths: Vec<P>,
+        max_workers: usize,
+        mut callback: Option<&mut dyn FnMut(BatchProgressEvent)>,
+    ) -> Result<BatchResult>
+    where
+        P: AsRef<Path> + Send + 'static,
+    {
+        let _guard = acquire_active_operation()?;
+        let paths = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let total = paths.len();
+        self.progress.set_total_tasks(total);
+        if total == 0 {
+            return Ok(BatchResult {
+                reports: Vec::new(),
+                errors: Vec::new(),
+            });
+        }
+
+        let queue = Arc::new(Mutex::new(
+            paths.into_iter().enumerate().collect::<VecDeque<_>>(),
+        ));
+        let outcomes = Arc::new(Mutex::new(Vec::with_capacity(total)));
         let options = self.options.clone();
-        let cancel = Some(self.cancel_token.clone());
-        let progress = Some(self.progress.clone());
-        ConcurrentProcessor::process_in_parallel(
-            paths,
-            cancel,
-            progress,
-            max_workers,
-            move |path| {
-                let engine = InspectionEngine::new(options.clone());
-                engine.inspect(path.as_ref())
-            },
-        )
+        let cancel = self.cancel_token.clone();
+        // Capacity one intentionally coalesces bursty worker completion updates. Workers use
+        // try_send and never wait for a GUI/IPC consumer.
+        let (progress_sender, progress_receiver) = mpsc::sync_channel(1);
+        let progress = self.progress.clone();
+        let workers = max_workers.max(1).min(total).min(32);
+        let mut handles = Vec::with_capacity(workers);
+        for worker_id in 0..workers {
+            let queue = queue.clone();
+            let outcomes = outcomes.clone();
+            let options = options.clone();
+            let cancel = cancel.clone();
+            let progress = progress.clone();
+            let progress_sender = progress_sender.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("vmspect-batch-{worker_id}"))
+                    .spawn(move || loop {
+                        if cancel.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let Some((index, path)) =
+                            queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+                        else {
+                            break;
+                        };
+                        if cancel.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let result = InspectionEngine::new(options.clone()).inspect(&path);
+                        progress.increment_completed_tasks();
+                        let completed = progress.completed_tasks();
+                        let _ = progress_sender.try_send(BatchProgressEvent {
+                            path: path.clone(),
+                            completed,
+                            total,
+                            percentage: ((completed * 100) / total) as u8,
+                            stage: "Image inspection completed".to_string(),
+                        });
+                        outcomes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((index, path, result));
+                    })
+                    .map_err(VmSpectError::Io)?,
+            );
+        }
+        drop(progress_sender);
+        let mut last_progress = None;
+        let mut last_emit = Instant::now() - Duration::from_millis(250);
+        loop {
+            match progress_receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => last_progress = Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if let (Some(event), Some(callback)) = (last_progress.take(), callback.as_mut()) {
+                if last_emit.elapsed() >= Duration::from_millis(250) {
+                    last_emit = Instant::now();
+                    callback(event);
+                } else {
+                    last_progress = Some(event);
+                }
+            }
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+        let mut outcomes = Arc::try_unwrap(outcomes)
+            .map(|outcomes| outcomes.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or_else(|outcomes| {
+                std::mem::take(&mut *outcomes.lock().unwrap_or_else(|e| e.into_inner()))
+            });
+        outcomes.sort_by_key(|(index, _, _)| *index);
+        let mut reports = Vec::new();
+        let mut errors = Vec::new();
+        let mut last_event = last_progress.map(|event| event.path);
+        for (_, path, outcome) in outcomes {
+            match outcome {
+                Ok(report) => reports.push(report),
+                Err(error) => errors.push(ImageInspectionError {
+                    path: path.clone(),
+                    error,
+                }),
+            }
+            last_event = Some(path);
+        }
+        if let (Some(path), Some(callback)) = (last_event, callback.as_mut()) {
+            let completed = reports.len() + errors.len();
+            // The final consolidated event is part of the API contract, including when the
+            // last worker event already reflected the same completion count.
+            let remaining = Duration::from_millis(250).saturating_sub(last_emit.elapsed());
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining);
+            }
+            callback(BatchProgressEvent {
+                path,
+                completed,
+                total,
+                percentage: ((completed * 100) / total) as u8,
+                stage: "Batch completed".to_string(),
+            });
+        }
+        Ok(BatchResult { reports, errors })
+    }
+
+    /// Runs a lightweight inspection suitable for an initial GUI/IPC listing.
+    pub fn inspect_summary(&self, image_path: &Path) -> Result<InspectionSummary> {
+        let mut options = self.options.clone();
+        options.no_apps = true;
+        InspectionEngine::new(options)
+            .inspect(image_path)
+            .map(|report| report.summary())
     }
 
     fn run_inspection(
@@ -461,7 +613,6 @@ impl InspectionEngine {
                         "Could not complete the guest OS analysis; continuing with image/partition data only: {}",
                         e
                     );
-                    tracing::warn!("{}", msg);
                     AnalysisResult {
                         warnings: vec![msg],
                         ..AnalysisResult::default()
@@ -637,6 +788,19 @@ mod tests {
             "Pending tasks must not have started after cancellation (started: {})",
             total_started
         );
+    }
+
+    #[test]
+    fn test_batch_collects_image_errors_in_input_order() {
+        let engine = InspectionEngine::new(Options::default());
+        let result = engine
+            .inspect_batch(vec!["missing-first.vmdk", "missing-second.vmdk"], 2)
+            .unwrap();
+        assert!(result.reports.is_empty());
+        assert_eq!(result.errors.len(), 2);
+        assert!(result.errors[0].path.ends_with("missing-first.vmdk"));
+        assert!(result.errors[1].path.ends_with("missing-second.vmdk"));
+        assert_eq!(engine.progress().completed_tasks(), 2);
     }
 
     #[test]

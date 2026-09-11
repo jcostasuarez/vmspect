@@ -35,8 +35,10 @@ It can examine partition-table structures (MBR/GPT), identify the guest operatin
   - Default, complete collection of all applications and system information without noise filters or proprietary categorizations.
   - Support for `--no-apps` (disables application collection) and `--no-system` (disables OS metadata collection) flags.
 - **Designed for UI and CLI:**
-  - Emits progress events in structured percentages (`0%` to `100%`) ideal for **Tauri**, **egui** or **Electron**.
+  - Emits lightweight, rate-limited batch progress events without report or program data.
   - Cancellation support via atomic tokens (`Arc<AtomicBool>` / `CancellationToken`) while preserving partial results.
+  - Directory discovery is explicit and configurable with exclusions and a maximum depth. Initial directory results skip installed-program extraction; use `--full-report` or a full inspection when that data is required.
+  - `qemu-nbd` sessions are limited process-wide (default: two); native readers do not consume a session.
 
 ---
 
@@ -52,7 +54,7 @@ Cuando falta un componente, `vmspect` devuelve `VmSpectError::MissingDiskCompone
 la ruta resuelta y el error original del sistema operativo. Por ejemplo:
 
 ```text
-Missing VMDK extent 'drive-0-cl2-s001.vmdk' referenced by 'D:\PLC N°4\Máquinas Virtuales\Windows UE 6.0 ROckWell Revs 9\drive-0-cl2.vmdk'. Resolved path: 'D:\PLC N°4\Máquinas Virtuales\Windows UE 6.0 ROckWell Revs 9\drive-0-cl2-s001.vmdk'. OS error: The system cannot find the file specified.
+Missing VMDK extent 'disk-s001.vmdk' referenced by 'fixtures/sample-vm/disk.vmdk'. Resolved path: 'fixtures/sample-vm/disk-s001.vmdk'. OS error: file not found.
 ```
 
 `qemu-nbd` no puede reparar una cadena VMDK incompleta: solo proporciona acceso a una imagen
@@ -211,17 +213,27 @@ fn main() -> Result<()> {
     // Cancel at any time from another thread or callback:
     // cancel.cancel();
 
-    // Returns all reports completed before and during cancellation:
-    let completed_reports = engine.inspect_batch(paths, 4)?;
+    // Returns completed reports and per-image errors without aborting the batch:
+    let batch = engine.inspect_batch(paths, 2)?;
 
-    println!("Total reports recovered: {}", completed_reports.len());
-    for r in &completed_reports {
+    println!("Total reports recovered: {}", batch.reports.len());
+    for r in &batch.reports {
         println!(" - {} (OS: {:?})", r.image.path.display(), r.operating_system);
     }
 
     Ok(())
 }
 ```
+
+### GUI / IPC initial listing
+
+For a GUI or IPC service, callers must always select the VM folders to discover; `vmspect`
+does not scan drive roots or any default location. Use `list_vms_with_options` to apply
+recursion, exclusions and depth limits. Perform the initial directory batch with
+`Options { no_apps: true, ..Options::default() }`, display each `InspectionSummary`, and
+run an individual full inspection only when the user opens a VM and needs
+`installed_programs`. Batch JSON is an object with `reports` and `errors`; directory JSON
+contains summaries unless `--full-report` is explicitly supplied.
 
 ### 4. Tauri / Async Runtime Integration
 

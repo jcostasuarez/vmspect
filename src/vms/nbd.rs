@@ -13,7 +13,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,47 @@ const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_DISC: u16 = 2;
 
 const NBD_OPT_EXPORT_NAME: u32 = 1;
+
+/// Process-wide accounting for active qemu-nbd sessions.
+static NBD_SESSIONS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+
+struct NbdSessionPermit;
+
+impl NbdSessionPermit {
+    fn acquire(options: &Options) -> io::Result<Self> {
+        let (active, wake) = NBD_SESSIONS.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let limit = options.nbd_max_sessions.max(1);
+        let mut count = active.lock().unwrap_or_else(|error| error.into_inner());
+        while *count >= limit {
+            if options
+                .cancel_token
+                .as_ref()
+                .map(|token| token.load(Ordering::Acquire))
+                .unwrap_or(false)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Inspection cancelled",
+                ));
+            }
+            let (new_count, _) = wake
+                .wait_timeout(count, Duration::from_millis(50))
+                .unwrap_or_else(|error| error.into_inner());
+            count = new_count;
+        }
+        *count += 1;
+        Ok(Self)
+    }
+}
+
+impl Drop for NbdSessionPermit {
+    fn drop(&mut self) {
+        let (active, wake) = NBD_SESSIONS.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let mut count = active.lock().unwrap_or_else(|error| error.into_inner());
+        *count = count.saturating_sub(1);
+        wake.notify_one();
+    }
+}
 const NBD_IHAVEOPT_MAGIC: u64 = 0x4948_4156_454F_5054; // "IHAVEOPT"
 
 /// Transport abstraction for the NBD communication stream (TCP or UNIX socket).
@@ -360,6 +401,8 @@ fn nbd_exit_message(path: &Path, status: std::process::ExitStatus, stderr: &str)
 
 /// Reader backed by a `qemu-nbd` server running in the background.
 pub struct NbdReader {
+    // Must be dropped after the process and socket, keeping the slot for the full session lifetime.
+    _permit: NbdSessionPermit,
     process: Child,
     client: RefCell<NbdStream>,
     unix_socket: Option<PathBuf>,
@@ -395,6 +438,7 @@ impl NbdReader {
             }
         }
 
+        let permit = NbdSessionPermit::acquire(options)?;
         let mut cmd = new_nbd_command(qemu_nbd_path);
         cmd.arg("--read-only");
 
@@ -572,6 +616,7 @@ impl NbdReader {
         };
 
         Ok(Self {
+            _permit: permit,
             process: child,
             client: RefCell::new(client),
             unix_socket: transport.unix_socket(),

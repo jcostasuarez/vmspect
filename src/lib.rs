@@ -49,7 +49,7 @@
 //!
 //! ```rust,no_run
 //! use std::path::PathBuf;
-//! use std::sync::atomic::Ordering;
+
 //! use vmspect::prelude::*;
 //!
 //! fn main() -> Result<()> {
@@ -66,9 +66,10 @@
 //!     // Cancellation can be requested from any thread:
 //!     // cancel.cancel();
 //!
-//!     // Returns the reports that completed successfully before and during shutdown:
-//!     let completed_reports = engine.inspect_batch(paths, 4)?;
-//!     println!("Preserved reports: {}", completed_reports.len());
+//!     // Returns successful reports and per-image errors, preserving input order.
+//!     let batch = engine.inspect_batch(paths, 2)?;
+//!     println!("Preserved reports: {}", batch.reports.len());
+//!     println!("Image errors: {}", batch.errors.len());
 //!
 //!     Ok(())
 //! }
@@ -79,23 +80,25 @@
 pub mod engine;
 pub mod error;
 pub mod models;
+pub(crate) mod operation;
 pub(crate) mod parsers;
 pub mod prelude;
 pub mod vms;
 
 // Flat public-API re-exports for ergonomic consumption from the crate root.
 pub use crate::vms::discovery::{
-    count_vms, has_vms, is_secondary_extent, is_vm_image, list_vms, requires_nbd, requires_qemu,
-    verify_image_integrity,
+    count_vms, has_vms, is_secondary_extent, is_vm_image, list_vms, list_vms_with_options,
+    requires_nbd, requires_qemu, verify_image_integrity, DiscoveryOptions, DiscoveryReport,
 };
 pub use crate::vms::stream::VirtualDisk;
 pub use engine::{ConcurrentProcessor, InspectionEngine};
 pub use error::{Result, VmSpectError};
 pub use models::{
-    format_bytes, AnalysisResult, CancellationToken, FileSystem, GuestInfo, GuestTools, Hypervisor,
-    ImageInfo, InspectionOptions, InspectionProgress, InspectionProgressEvent, InspectionReport,
-    MemoryMapper, OperatingSystem, Options, OsInspector, Partition, PartitionScheme, Program,
-    ProgressSnapshot, Stats, VmDriver,
+    format_bytes, AnalysisResult, BatchProgressEvent, BatchResult, CancellationToken, FileSystem,
+    GuestInfo, GuestTools, Hypervisor, ImageInfo, ImageInspectionError, InspectionOptions,
+    InspectionProgress, InspectionProgressEvent, InspectionReport, InspectionSummary, MemoryMapper,
+    OperatingSystem, Options, OsInspector, Partition, PartitionScheme, Program, ProgressSnapshot,
+    Stats, VmDriver,
 };
 
 use std::path::Path;
@@ -133,7 +136,7 @@ use std::path::Path;
 /// use std::path::Path;
 /// use vmspect::{inspect, Options};
 ///
-/// let path = Path::new("C:\\VMs\\Windows10.vmdk");
+/// let path = Path::new("disk.vmdk");
 /// let options = Options::default();
 ///
 /// let result = inspect(path, &options, &mut |message| {

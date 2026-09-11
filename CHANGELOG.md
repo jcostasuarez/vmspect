@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 (while the major version is `0`, minor-version increments may include breaking changes,
 as foreseen by SemVer for the `0.y.z` series).
 
+## [0.9.0] - 2026-09-11
+
+### Breaking Changes
+- Standard inspection no longer launches `qemu-nbd` automatically for formats without a direct parser; enable `Options::with_force_nbd(true)` or `--force-nbd` explicitly when the external read-only helper is acceptable.
+- Unsupported formats now return `VmSpectError::UnsupportedFormat` in standard mode instead of falling back to an external backend.
+
+### Added
+- Added bounded direct-read caching and telemetry for read operations, cache hits, source classification and per-phase durations.
+- Added explicit warnings and diagnostics when the external `qemu-nbd` compatibility backend is enabled.
+
+### Changed
+- Standard image access is read-only and direct for supported RAW and VMDK layouts, without mounting or attaching images to the host.
+- CLI reports now include backend, I/O and phase-duration statistics.
+
 ## [0.8.0] - 2026-09-11
 
 ### Breaking Changes

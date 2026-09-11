@@ -305,11 +305,12 @@ pub struct Options {
     pub no_system: bool,
     /// If `true`, forces reading of the `SYSTEM` hive in addition to `SOFTWARE` on Windows.
     pub include_system: bool,
-    /// Explicit path to the `qemu-nbd` binary. If `None`, it is searched automatically.
+    /// Explicit path to the `qemu-nbd` binary. It is resolved only when `force_nbd` is enabled.
     pub qemu_nbd: Option<PathBuf>,
     /// Chunk size (bytes) used by the read cache. `None` sets the automatic optimal size.
     pub chunk_size: Option<u64>,
-    /// If `true`, forces the use of `qemu-nbd` even if the format admits native reading in Rust.
+    /// Explicitly permits the external read-only `qemu-nbd` helper. Disabled by default: standard
+    /// inspection never starts this helper, attaches a disk, or mounts an image in the host OS.
     pub force_nbd: bool,
     /// Specifies the path to a UNIX domain socket (`--socket-path` / `-k` in qemu-nbd) instead of
     /// the default loopback TCP port.
@@ -370,7 +371,10 @@ impl Options {
         self
     }
 
-    /// Configures whether the `qemu-nbd` backend should be forced.
+    /// Explicitly permits the `qemu-nbd` read-only helper for formats without a direct parser.
+    ///
+    /// This does not mount or attach an image to the host OS, but it starts an external process;
+    /// callers should present a warning and obtain user consent before enabling it.
     pub fn with_force_nbd(mut self, force: bool) -> Self {
         self.force_nbd = force;
         self

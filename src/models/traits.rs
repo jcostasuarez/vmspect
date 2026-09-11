@@ -34,6 +34,9 @@ pub trait VmDriver {
     fn recommended_chunk_size(&self) -> u64 {
         1024 * 1024
     }
+
+    /// Records a bounded-cache hit. Drivers that do not collect I/O metrics can ignore it.
+    fn record_cache_hit(&self) {}
 }
 
 /// Abstract contract for memory, block or virtual disk range mappers.

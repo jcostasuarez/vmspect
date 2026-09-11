@@ -9,9 +9,9 @@
 //!
 //! ## Key Features
 //!
-//! - **Hybrid access:** Native Rust parser for common formats (VMDK/RAW) with a lightweight
-//!   dynamic-streaming layer via `qemu-nbd` (local TCP) for complex formats (`QCOW2`,
-//!   `VHDX`, `VDI`, ...).
+//! - **Direct read by default:** Native Rust parser for common formats (VMDK/RAW), opened
+//!   read-only without mounting or attaching the image. The optional `qemu-nbd` compatibility
+//!   helper for complex formats is disabled unless `Options::with_force_nbd(true)` is selected.
 //! - **Multi-OS support:** Full software extraction from the Windows Registry (`NTFS`) and
 //!   DPKG indexes on Linux (`EXT4`).
 //! - **Agnostic extraction:** Complete and unfiltered collection of software and system
@@ -142,10 +142,10 @@ use std::path::Path;
 ///   resolved component paths, plus the original operating-system error.
 /// - The inspection was cancelled by the user ([`VmSpectError::Cancelled`]).
 /// - An I/O read error occurs on the image ([`VmSpectError::Io`]).
-/// - The image requires the `qemu-nbd` server and the executable is unavailable
-///   ([`VmSpectError::QemuNotFound`]).
-/// - Starting or communicating with `qemu-nbd` fails ([`VmSpectError::Nbd`]), including the
-///   executable path, exit code and `stderr` when the subprocess provides them.
+/// - The image has no direct parser ([`VmSpectError::UnsupportedFormat`]). Standard mode does
+///   not start external compatibility backends automatically.
+/// - When the caller explicitly enables `Options::with_force_nbd(true)`, the `qemu-nbd` helper
+///   is unavailable ([`VmSpectError::QemuNotFound`]) or fails ([`VmSpectError::Nbd`]).
 /// - The partition table or underlying file system cannot be recognized
 ///   ([`VmSpectError::FileSystem`]).
 ///

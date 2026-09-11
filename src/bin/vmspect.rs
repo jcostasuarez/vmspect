@@ -22,7 +22,7 @@ struct CliConfig {
     json_format: bool,
     /// Runs the analysis in parallel via [`ConcurrentProcessor`].
     concurrent: bool,
-    /// Forces the `qemu-nbd` backend even for natively-readable formats.
+    /// Explicitly permits the external read-only `qemu-nbd` helper.
     force_nbd: bool,
     /// Recursive search when the target is a directory.
     recursive: bool,
@@ -58,7 +58,7 @@ ARGUMENTS:
 OPTIONS:
     --json                     Prints structured JSON output to stdout.
     --concurrent               Enables concurrent image processing via ConcurrentProcessor.
-    --force-nbd                Forces the qemu-nbd backend for every disk format.
+    --force-nbd                Explicitly permits qemu-nbd for formats without direct support.
     -r, --recursive            Searches images recursively when scanning a directory.
     --no-apps                  Skips extraction of the installed-software catalog.
     --no-system                Skips extraction of guest-OS information and metadata.
@@ -224,6 +224,12 @@ fn main() {
         include_system: config.include_system,
         ..Default::default()
     };
+
+    if config.force_nbd {
+        eprintln!(
+            "Warning: --force-nbd launches qemu-nbd as an external read-only helper. It does not mount or attach the image, but is disabled by default because it adds another I/O layer."
+        );
+    }
 
     if path.is_file() {
         run_file(path, &options, config.json_format);
@@ -481,9 +487,20 @@ fn print_human_report(report: &InspectionReport, duration_ms: u64) {
         "    Bytes Read:      {}",
         format_bytes(report.stats.bytes_read)
     );
+    println!("    Read Operations: {}", report.stats.read_operations);
+    println!("    Cache Hits:      {}", report.stats.cache_hits);
+    println!("    Source Location: {}", report.stats.source_location);
     if report.stats.nbd_requests > 0 {
         println!("    NBD Requests:    {}", report.stats.nbd_requests);
     }
+    println!(
+        "    Phase Durations: identify {} ms | backend {} ms | partitions {} ms | guest {} ms | report {} ms",
+        report.stats.identification_duration_ms,
+        report.stats.backend_initialization_duration_ms,
+        report.stats.partition_detection_duration_ms,
+        report.stats.guest_analysis_duration_ms,
+        report.stats.report_generation_duration_ms
+    );
     println!(
         "    Duration:        {} ms ({:.2} s)",
         duration_ms,

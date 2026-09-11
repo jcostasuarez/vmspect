@@ -10,8 +10,7 @@ use crate::models::InspectionReport;
 use crate::operation::acquire_active_operation;
 use crate::parsers;
 use crate::vms;
-use crate::vms::nbd::{self, NbdReader};
-use crate::vms::stream::{identify_image, validate_vmdk_components, DiskReader};
+use crate::vms::stream::{identify_image, DiskReader};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -476,6 +475,7 @@ impl InspectionEngine {
                     VmSpectError::Io(error)
                 }
             })?;
+        let identification_duration_ms = start.elapsed().as_millis() as u64;
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
@@ -496,24 +496,26 @@ impl InspectionEngine {
             });
         }
 
-        let reader = if effective_options.force_nbd {
-            if image.format.eq_ignore_ascii_case("vmdk") {
-                validate_vmdk_components(&image.path)?;
+        if effective_options.force_nbd {
+            if let Some(ref mut cb) = callback {
+                cb(InspectionProgressEvent {
+                    percentage: 15,
+                    stage: "Explicit external backend enabled".into(),
+                    detail: Some(
+                        "Warning: qemu-nbd will be launched as an explicitly requested, read-only helper. It does not mount or attach the image in the host OS."
+                            .into(),
+                    ),
+                });
             }
-            let nbd_path = nbd::resolve_qemu_nbd(effective_options.qemu_nbd.as_deref())
-                .map_err(|error| VmSpectError::QemuNotFound(error.to_string()))?;
-            let nbd_reader = NbdReader::open_with_options(&nbd_path, &image, &effective_options)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        VmSpectError::Cancelled
-                    } else {
-                        VmSpectError::Nbd(error.to_string())
-                    }
-                })?;
-            DiskReader::from_nbd(nbd_reader, &image, Some(self.cancel_token.clone()))
-        } else {
-            DiskReader::open_with_options_diagnostic(&image, &effective_options)?
-        };
+        }
+        let backend_started = Instant::now();
+        let reader = DiskReader::open_with_options_diagnostic(&image, &effective_options)?;
+        let backend_initialization_duration_ms = backend_started.elapsed().as_millis() as u64;
+        tracing::info!(
+            backend = reader.access_mode(),
+            source_location = %reader.stats().source_location,
+            "virtual image read backend initialized"
+        );
 
         let chunk_size = effective_options
             .chunk_size
@@ -538,6 +540,7 @@ impl InspectionEngine {
             });
         }
 
+        let partition_started = Instant::now();
         let disk = vms::detector::detect_with_progress(
             &reader,
             Some(self.cancel_token.clone()),
@@ -550,6 +553,7 @@ impl InspectionEngine {
                 VmSpectError::Io(error)
             }
         })?;
+        let partition_detection_duration_ms = partition_started.elapsed().as_millis() as u64;
 
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
@@ -583,6 +587,7 @@ impl InspectionEngine {
         // (e.g. dirty/corrupt Windows Registry) must NOT abort the
         // entire pipeline. It is logged as a warning and inspection
         // continues with already-collected image, partition and FS data.
+        let guest_analysis_started = Instant::now();
         let result = if effective_options.should_analyze_system()
             || effective_options.should_analyze_apps()
         {
@@ -604,6 +609,7 @@ impl InspectionEngine {
             AnalysisResult::default()
         };
 
+        let guest_analysis_duration_ms = guest_analysis_started.elapsed().as_millis() as u64;
         if self.is_cancelled() {
             return Err(VmSpectError::Cancelled);
         }
@@ -622,8 +628,27 @@ impl InspectionEngine {
             });
         }
 
+        let report_started = Instant::now();
         let mut stats = reader.stats();
+        stats.identification_duration_ms = identification_duration_ms;
+        stats.backend_initialization_duration_ms = backend_initialization_duration_ms;
+        stats.partition_detection_duration_ms = partition_detection_duration_ms;
+        stats.guest_analysis_duration_ms = guest_analysis_duration_ms;
+        stats.report_generation_duration_ms = report_started.elapsed().as_millis() as u64;
         stats.duration_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            backend = %stats.access_mode,
+            bytes_read = stats.bytes_read,
+            read_operations = stats.read_operations,
+            cache_hits = stats.cache_hits,
+            identification_duration_ms = stats.identification_duration_ms,
+            backend_initialization_duration_ms = stats.backend_initialization_duration_ms,
+            partition_detection_duration_ms = stats.partition_detection_duration_ms,
+            guest_analysis_duration_ms = stats.guest_analysis_duration_ms,
+            report_generation_duration_ms = stats.report_generation_duration_ms,
+            duration_ms = stats.duration_ms,
+            "virtual image inspection completed"
+        );
 
         let report = InspectionReport {
             image,
@@ -641,7 +666,13 @@ impl InspectionEngine {
             cb(InspectionProgressEvent {
                 percentage: 100,
                 stage: "Analysis completed successfully".into(),
-                detail: None,
+                detail: Some(format!(
+                    "Backend: {} | Reads: {} | Bytes: {} | Cache hits: {}",
+                    report.stats.access_mode,
+                    report.stats.read_operations,
+                    crate::models::format_bytes(report.stats.bytes_read),
+                    report.stats.cache_hits
+                )),
             });
         }
 

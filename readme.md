@@ -6,15 +6,16 @@
 
 `vmspect` is a Rust library and CLI tool for **ultra-fast static inspection, forensic analysis and information extraction of virtual machine disk images** (VMDK, RAW, QCOW2, VHD, VHDX, VDI, etc.).
 
-It can examine partition-table structures (MBR/GPT), identify the guest operating system (Windows/Linux), extract complete lists of installed software and detect integration tools (Guest Tools) in a **non-invasive** way (without booting the virtual machine or requiring mount privileges on the host) in **less than 70 ms** even for virtual disks larger than 80 GiB.
+It can examine partition-table structures (MBR/GPT), identify the guest operating system (Windows/Linux), extract complete lists of installed software and detect integration tools (Guest Tools) in a **non-invasive** way. Standard inspection opens the image read-only and never boots, mounts or attaches it to the host, so it needs no administrator privileges and creates no visible drive.
 
 ---
 
 ## 🚀 Key Features
 
-- **Extreme performance and lightweight streaming (<70 ms for 80 GiB images):**
-  - **Native Rust parser:** Direct, ultra-low-latency reading for `RAW` and `VMDK` images (`monolithicSparse`, `monolithicFlat`, `twoGbMaxExtentFlat/Sparse`, etc.) without external dependencies or child processes.
-  - **Integrated `qemu-nbd` server:** For complex formats (`QCOW2`, `VHDX`, `VDI`, compressed/streamOptimized VMDK), connects over a local TCP socket (`127.0.0.1`) or UNIX sockets using the standard NBD protocol, with direct block streaming and no temporary files on disk.
+- **Direct-read by default, with bounded I/O:**
+  - **Native Rust parser:** Direct, read-only on-demand reads for `RAW` and supported `VMDK` layouts (`monolithicSparse`, `monolithicFlat`, `twoGbMaxExtentFlat/Sparse`, etc.), without child processes, temporary image copies, host mounting or attachment.
+  - **Explicit external compatibility mode:** Formats without a native parser (`QCOW2`, `VHDX`, `VDI`, compressed/streamOptimized VMDK) fail clearly in standard mode. Only `--force-nbd` / `Options::with_force_nbd(true)` starts `qemu-nbd` as a read-only helper; it is never an automatic fallback and does not mount or attach a host volume.
+  - **Bounded cache and telemetry:** The parser loads only needed ranges into a bounded 64 MiB LRU cache and reports backend, reads, bytes, cache hits and phase durations.
 - **Resilience against dirty registries and NTFS fallback (Graceful Degradation):**
   - **Permissive Windows Registry reading:** Tolerance for dirty or damaged registry hives (`SequenceNumberMismatch` caused by abrupt shutdowns or hot snapshots) using `Hive::without_validation` and isolating internal panics from third-party libraries via `catch_unwind`.
   - **NTFS fallback inspection:** If the Registry hives are totally inaccessible, `vmspect` gracefully degrades by inspecting the PE header of `\Windows\System32\ntoskrnl.exe` directly to extract the OS build and version, and scans `\Program Files`, tagging applications as `source: Some("FallbackFS")`.
@@ -38,11 +39,26 @@ It can examine partition-table structures (MBR/GPT), identify the guest operatin
   - Exposes lock-free batch progress snapshots for external polling without report or program data.
   - Cancellation support via atomic tokens (`Arc<AtomicBool>` / `CancellationToken`) while preserving partial results.
   - Directory discovery is explicit and configurable with exclusions and a maximum depth. Initial directory results skip installed-program extraction; use `--full-report` or a full inspection when that data is required.
-  - `qemu-nbd` sessions are limited process-wide (default: two); native readers do not consume a session.
+  - `qemu-nbd` sessions are limited process-wide (default: two) when explicitly enabled; direct readers do not consume a session.
 
 ---
 
-## Diagnóstico de discos VMDK y `qemu-nbd`
+## Política de no montaje y diagnóstico de `qemu-nbd`
+
+El análisis estándar es **direct-read**: abre el archivo de imagen y sus extents en modo solo lectura,
+lee cabeceras, tablas de partición y los rangos demandados por los parsers de NTFS/ext4. No usa
+`Mount-DiskImage`, `diskpart`, `AttachVirtualDisk`, WMI/CIM, Hyper-V ni adaptadores de montaje,
+y no crea letras de unidad, volúmenes, recursos compartidos ni copias temporales de la imagen.
+
+Para formatos que aún no tienen parser directo, el análisis estándar devuelve un error
+`UnsupportedFormat` en vez de lanzar un fallback. `--force-nbd` es una decisión explícita y muestra
+una advertencia antes de iniciar el ayudante `qemu-nbd` de solo lectura. Este ayudante expone un
+socket local al proceso, no una unidad del sistema operativo.
+
+Las rutas UNC se marcan como origen de red en `Stats`; las unidades mapeadas y las carpetas
+sincronizadas no se etiquetan de forma especulativa porque no puede detectarse de modo fiable sin
+consultar servicios específicos del host. La biblioteca no escribe archivos de resultados: el
+llamador decide dónde serializar el informe.
 
 Un descriptor VMDK no siempre contiene los datos del disco. Puede declarar varios extents
 (`FLAT`, `VMFS`, `VMFSRAW`, `SPARSE` o `VMFSSPARSE`) y también puede apuntar a un disco padre
@@ -181,7 +197,7 @@ use vmspect::Options;
 let light_options = Options {
     no_apps: true,           // Skip installed-software scan
     no_system: false,        // Keep OS detection and Guest Tools
-    force_nbd: false,        // Use the ultra-fast native parser when available
+    force_nbd: false,        // Standard mode: never launch an external fallback
     ..Options::default()
 };
 

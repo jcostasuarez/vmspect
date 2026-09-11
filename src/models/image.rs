@@ -60,13 +60,44 @@ pub struct ImageInfo {
 /// Performance statistics and metrics collected during the inspection process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stats {
-    /// Description of the access backend used (e.g. "native (...)" or "qemu-nbd tcp (...)").
+    /// Read backend used, normally `direct-read (...)`; `qemu-nbd` is only used after explicit opt-in.
     pub access_mode: String,
-    /// Number of requests issued to the read backend (NBD socket in virtualized mode).
+    /// Number of requests issued to the NBD socket when the explicit external backend is used.
+    #[serde(default)]
     pub nbd_requests: u64,
-    /// Total number of bytes physically extracted from the virtual disk.
+    /// Number of range reads issued to the image backend.
+    #[serde(default)]
+    pub read_operations: u64,
+    /// Number of image reads avoided by the bounded `VirtualDisk` cache.
+    #[serde(default)]
+    pub cache_hits: u64,
+    /// Total bytes extracted from the virtual disk.
+    #[serde(default)]
     pub bytes_read: u64,
+    /// Source classification when it can be determined without probing the host. `unc-network`
+    /// is reliable for UNC paths; mapped drives and synchronized folders remain `unclassified`.
+    #[serde(default)]
+    pub source_location: String,
+    /// `Some(true)` only when the source is reliably known to be a UNC network path.
+    #[serde(default)]
+    pub source_is_network: Option<bool>,
+    /// Duration of format and metadata identification.
+    #[serde(default)]
+    pub identification_duration_ms: u64,
+    /// Duration of backend initialization.
+    #[serde(default)]
+    pub backend_initialization_duration_ms: u64,
+    /// Duration of partition and file-system signature detection.
+    #[serde(default)]
+    pub partition_detection_duration_ms: u64,
+    /// Duration of guest operating-system inventory extraction.
+    #[serde(default)]
+    pub guest_analysis_duration_ms: u64,
+    /// Duration of final report consolidation.
+    #[serde(default)]
+    pub report_generation_duration_ms: u64,
     /// Total time the inspection process took, expressed in milliseconds.
+    #[serde(default)]
     pub duration_ms: u64,
 }
 

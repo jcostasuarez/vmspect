@@ -1,17 +1,16 @@
-//! Virtual disk access: native parsing when possible and `qemu-nbd` for complex formats.
+//! Virtual disk access with direct, read-only parsing as the standard policy.
 //!
 //! Hierarchy
 //! ---------
-//! - [`DiskReader`]: single façade. Picks the backend when the image is opened
-//!   and exposes `read_range(offset, len)` on virtual disk coordinates.
-//!   - **Native** (`std::fs::File` + `Seek`, no child processes): `raw` images,
-//!     `monolithicSparse` VMDKs without a parent, and VMDK text-descriptor
-//!     files whose extents are `FLAT` / `VMFS` / `SPARSE` / `ZERO`
-//!     (`monolithicFlat`, `twoGbMaxExtentFlat`/`Sparse`, `vmfs`).
-//!   - **`qemu-nbd`** ([`NbdReader`]): complex formats (VDI, VHD/VHDX, QCOW2,
-//!     streamOptimized VMDK, snapshots/deltas, backing files, ...).
-//! - [`VirtualDisk`]: `Read + Seek` view of a disk range (typically a single
-//!   partition) with an LRU chunk cache. Consumed by the parsers.
+//! - [`DiskReader`]: single façade that exposes `read_range(offset, len)` on virtual-disk
+//!   coordinates. Standard inspection accepts only the direct reader:
+//!   `std::fs::File` + `Seek` for `raw` images, `monolithicSparse` VMDKs without a parent,
+//!   and VMDK text descriptors with `FLAT` / `VMFS` / `SPARSE` / `ZERO` extents.
+//! - [`NbdReader`] is an explicitly opted-in external read backend for formats not yet parsed
+//!   natively. It is never selected automatically and it does not attach or mount a disk in the
+//!   host OS.
+//! - [`VirtualDisk`]: `Read + Seek` view of a disk range (typically a single partition) with a
+//!   bounded LRU chunk cache. Consumed by the parsers.
 
 use crate::error::VmSpectError;
 use crate::models::traits::{MemoryMapper, VmDriver};
@@ -306,7 +305,7 @@ enum Backend {
     Nbd(NbdReader),
 }
 
-/// Façade over the virtual disk. Picks the native or `qemu-nbd` backend at open time.
+/// Façade over the virtual disk. Standard opening selects only the direct read backend.
 pub struct DiskReader {
     backend: RefCell<Backend>,
     virtual_size: u64,
@@ -316,11 +315,10 @@ pub struct DiskReader {
 }
 
 impl DiskReader {
-    /// Opens the image, automatically selecting the most optimal backend.
+    /// Opens an image through the direct, read-only backend.
     ///
-    /// Priority:
-    /// 1. Native Rust backend (RAW / sparse VMDK / flat VMDK).
-    /// 2. `qemu-nbd` (local UNIX socket or streaming TCP, with no temp-file overhead).
+    /// Formats without a native parser return an error instead of spawning an external helper.
+    /// Use [`Options::with_force_nbd`] only after explicitly accepting the external backend.
     pub fn open(
         qemu_nbd: Option<&Path>,
         info: &ImageInfo,
@@ -334,7 +332,8 @@ impl DiskReader {
         Self::open_with_options(info, &options)
     }
 
-    /// Opens the image, automatically selecting the most optimal backend for the supplied [`Options`].
+    /// Opens an image with the supplied [`Options`]. The external NBD backend is used only when
+    /// `Options::force_nbd` is explicitly enabled.
     pub fn open_with_options(info: &ImageInfo, options: &Options) -> io::Result<Self> {
         Self::open_with_options_diagnostic(info, options).map_err(diagnostic_to_io)
     }
@@ -344,32 +343,49 @@ impl DiskReader {
         info: &ImageInfo,
         options: &Options,
     ) -> crate::error::Result<Self> {
-        let (backend, mode, size_adjusted) = match open_native(info)? {
-            OpenResult::Native((b, mode)) => (b, format!("native ({})", mode), info.virtual_size),
-            OpenResult::NeedsNbd(reason) => {
-                let nbd_path = nbd::resolve_qemu_nbd(options.qemu_nbd.as_deref())
-                    .map_err(|error| VmSpectError::QemuNotFound(error.to_string()))?;
-                let nbd_reader = NbdReader::open_with_options(&nbd_path, info, options)
-                    .map_err(nbd_error_to_vm)?;
-                let size_nbd = nbd_reader.virtual_size().max(info.virtual_size);
-                let channel = if options.unix_socket.is_some() {
-                    "unix"
-                } else {
-                    "tcp"
-                };
-                (
-                    Backend::Nbd(nbd_reader),
-                    format!("qemu-nbd {} ({})", channel, reason),
-                    size_nbd,
-                )
+        let (backend, mode, size_adjusted) = if options.force_nbd {
+            if info.format.eq_ignore_ascii_case("vmdk") {
+                validate_vmdk_components(&info.path)?;
+            }
+            let nbd_path = nbd::resolve_qemu_nbd(options.qemu_nbd.as_deref())
+                .map_err(|error| VmSpectError::QemuNotFound(error.to_string()))?;
+            let nbd_reader =
+                NbdReader::open_with_options(&nbd_path, info, options).map_err(nbd_error_to_vm)?;
+            let size_nbd = nbd_reader.virtual_size().max(info.virtual_size);
+            let channel = if options.unix_socket.is_some() {
+                "unix"
+            } else {
+                "tcp"
+            };
+            (
+                Backend::Nbd(nbd_reader),
+                format!("explicit qemu-nbd {}", channel),
+                size_nbd,
+            )
+        } else {
+            match open_native(info)? {
+                OpenResult::Native((backend, mode)) => (
+                    backend,
+                    format!("direct-read ({})", mode),
+                    info.virtual_size,
+                ),
+                OpenResult::NeedsNbd(reason) => {
+                    return Err(VmSpectError::UnsupportedFormat(format!(
+                        "{} requires an external read backend ({reason}). Standard inspection uses direct, read-only file access only and will not launch qemu-nbd automatically. Enable Options::with_force_nbd(true) or --force-nbd only after reviewing its external-helper warning.",
+                        info.format
+                    )));
+                }
             }
         };
+        let (source_location, source_is_network) = classify_source_path(&info.path);
 
         Ok(Self {
             backend: RefCell::new(backend),
             virtual_size: size_adjusted,
             stats: RefCell::new(Stats {
                 access_mode: mode.clone(),
+                source_location: source_location.to_string(),
+                source_is_network,
                 ..Stats::default()
             }),
             access_mode: mode,
@@ -384,12 +400,15 @@ impl DiskReader {
         cancel_token: Option<Arc<AtomicBool>>,
     ) -> Self {
         let virtual_size = reader.virtual_size().max(info.virtual_size);
-        let mode = "qemu-nbd tcp (forced)".to_string();
+        let mode = "explicit qemu-nbd tcp".to_string();
+        let (source_location, source_is_network) = classify_source_path(&info.path);
         Self {
             backend: RefCell::new(Backend::Nbd(reader)),
             virtual_size,
             stats: RefCell::new(Stats {
                 access_mode: mode.clone(),
+                source_location: source_location.to_string(),
+                source_is_network,
                 ..Stats::default()
             }),
             access_mode: mode,
@@ -431,6 +450,7 @@ impl DiskReader {
         }
         let len = len.min((self.virtual_size - offset) as usize);
 
+        self.stats.borrow_mut().read_operations += 1;
         let data = match &mut *self.backend.borrow_mut() {
             Backend::Raw(file) => {
                 let mut buf = vec![0u8; len];
@@ -508,6 +528,22 @@ impl VmDriver for DiskReader {
 
     fn recommended_chunk_size(&self) -> u64 {
         self.recommended_chunk_size()
+    }
+
+    fn record_cache_hit(&self) {
+        self.stats.borrow_mut().cache_hits += 1;
+    }
+}
+
+/// Returns only classifications that can be inferred without probing volumes or cloud clients.
+/// A mapped Windows drive (for example `G:`) intentionally remains unclassified because the
+/// standard library cannot reliably distinguish a local, network or synchronized drive.
+fn classify_source_path(path: &Path) -> (&'static str, Option<bool>) {
+    let text = path.as_os_str().to_string_lossy();
+    if text.starts_with(r"\\") {
+        ("unc-network", Some(true))
+    } else {
+        ("unclassified", None)
     }
 }
 
@@ -871,7 +907,7 @@ impl<'a> VirtualDisk<'a> {
             let within_chunk = (current_offset % self.chunk_size) as usize;
 
             // Make sure the required chunk sits at the front of the cache.
-            {
+            let cache_hit = {
                 let mut cache = self.cache.borrow_mut();
                 if let Some(p) = cache.iter().position(|(i, _)| *i == chunk_index) {
                     if p > 0 {
@@ -879,6 +915,7 @@ impl<'a> VirtualDisk<'a> {
                             cache.push_front(entry);
                         }
                     }
+                    true
                 } else {
                     // Load the chunk from the driver, briefly releasing the cache borrow.
                     drop(cache);
@@ -900,7 +937,11 @@ impl<'a> VirtualDisk<'a> {
                         cache.pop_back();
                     }
                     cache.push_front((chunk_index, read));
+                    false
                 }
+            };
+            if cache_hit {
+                self.driver.record_cache_hit();
             }
 
             let cache = self.cache.borrow();
@@ -969,6 +1010,43 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn read_only_open_rejects_writes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("readonly.raw");
+        std::fs::write(&file_path, b"immutable through this handle").unwrap();
+
+        let mut file = open_read_file(&file_path).unwrap();
+        assert!(file.write_all(b"write").is_err());
+    }
+
+    #[test]
+    fn standard_open_does_not_resolve_external_backend() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let image_path = temp_dir.path().join("unsupported.vhdx");
+        std::fs::write(&image_path, b"vhdxfile").unwrap();
+        let info = ImageInfo {
+            path: image_path,
+            format: "vhdx".to_string(),
+            virtual_size: 8,
+            actual_size: 8,
+            hypervisor: Hypervisor::HyperV,
+        };
+        let options = Options {
+            qemu_nbd: Some(temp_dir.path().join("must-not-be-resolved")),
+            ..Options::default()
+        };
+
+        let error = match DiskReader::open_with_options_diagnostic(&info, &options) {
+            Ok(_) => panic!("standard mode must not resolve an external backend"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, VmSpectError::UnsupportedFormat(_)));
+        assert!(error
+            .to_string()
+            .contains("will not launch qemu-nbd automatically"));
+    }
+
+    #[test]
     fn test_virtual_disk_read_seek() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("test_disk.raw");
@@ -1017,6 +1095,10 @@ mod tests {
         let n = disk.read_at(250 * 4, &mut read_at_buf).unwrap();
         assert_eq!(n, 4);
         assert_eq!(&read_at_buf, &250u32.to_le_bytes());
+        let stats = reader.stats();
+        assert_eq!(stats.access_mode, "direct-read (raw)");
+        assert!(stats.read_operations > 0);
+        assert!(stats.cache_hits > 0);
     }
 
     #[test]

@@ -140,3 +140,24 @@ fn options_have_safe_nbd_defaults() {
     assert!(!options.force_nbd);
     assert_eq!(options.nbd_max_sessions, 2);
 }
+
+#[test]
+fn standard_inspection_does_not_fall_back_to_an_external_backend() {
+    let _guard = test_operation_guard();
+    let tempdir = tempfile::tempdir().unwrap();
+    let image = tempdir.path().join("unsupported.vhdx");
+    std::fs::write(&image, b"vhdxfile").unwrap();
+    let unavailable_helper = tempdir.path().join("must-not-be-resolved-or-started");
+    let options = Options {
+        qemu_nbd: Some(unavailable_helper),
+        no_apps: true,
+        no_system: true,
+        ..Options::default()
+    };
+
+    let error = InspectionEngine::new(options).inspect(&image).unwrap_err();
+    assert!(matches!(error, VmSpectError::UnsupportedFormat(_)));
+    assert!(error
+        .to_string()
+        .contains("will not launch qemu-nbd automatically"));
+}
